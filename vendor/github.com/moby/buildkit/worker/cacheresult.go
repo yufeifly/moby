@@ -20,7 +20,7 @@ type cacheResultStorage struct {
 	wc *Controller
 }
 
-func (s *cacheResultStorage) Save(res solver.Result) (solver.CacheResult, error) {
+func (s *cacheResultStorage) Save(res solver.Result, createdAt time.Time) (solver.CacheResult, error) {
 	ref, ok := res.Sys().(*WorkerRef)
 	if !ok {
 		return solver.CacheResult{}, errors.Errorf("invalid result: %T", res.Sys())
@@ -33,10 +33,10 @@ func (s *cacheResultStorage) Save(res solver.Result) (solver.CacheResult, error)
 			ref.ImmutableRef.Metadata().Commit()
 		}
 	}
-	return solver.CacheResult{ID: ref.ID(), CreatedAt: time.Now()}, nil
+	return solver.CacheResult{ID: ref.ID(), CreatedAt: createdAt}, nil
 }
 func (s *cacheResultStorage) Load(ctx context.Context, res solver.CacheResult) (solver.Result, error) {
-	return s.load(res.ID)
+	return s.load(res.ID, false)
 }
 
 func (s *cacheResultStorage) getWorkerRef(id string) (Worker, string, error) {
@@ -51,7 +51,7 @@ func (s *cacheResultStorage) getWorkerRef(id string) (Worker, string, error) {
 	return w, refID, nil
 }
 
-func (s *cacheResultStorage) load(id string) (solver.Result, error) {
+func (s *cacheResultStorage) load(id string, hidden bool) (solver.Result, error) {
 	w, refID, err := s.getWorkerRef(id)
 	if err != nil {
 		return nil, err
@@ -59,7 +59,7 @@ func (s *cacheResultStorage) load(id string) (solver.Result, error) {
 	if refID == "" {
 		return NewWorkerRefResult(nil, w), nil
 	}
-	ref, err := w.LoadRef(refID)
+	ref, err := w.LoadRef(refID, hidden)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +71,7 @@ func (s *cacheResultStorage) LoadRemote(ctx context.Context, res solver.CacheRes
 	if err != nil {
 		return nil, err
 	}
-	ref, err := w.LoadRef(refID)
+	ref, err := w.LoadRef(refID, true)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +83,7 @@ func (s *cacheResultStorage) LoadRemote(ctx context.Context, res solver.CacheRes
 	return remote, nil
 }
 func (s *cacheResultStorage) Exists(id string) bool {
-	ref, err := s.load(id)
+	ref, err := s.load(id, true)
 	if err != nil {
 		return false
 	}

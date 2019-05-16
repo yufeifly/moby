@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/containerd/ttrpc"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 )
@@ -42,10 +43,7 @@ var (
 
 // IsSkipPlugin returns true if the error is skipping the plugin
 func IsSkipPlugin(err error) bool {
-	if errors.Cause(err) == ErrSkipPlugin {
-		return true
-	}
-	return false
+	return errors.Cause(err) == ErrSkipPlugin
 }
 
 // Type is the type of the plugin
@@ -76,6 +74,15 @@ const (
 	ContentPlugin Type = "io.containerd.content.v1"
 	// GCPlugin implements garbage collection policy
 	GCPlugin Type = "io.containerd.gc.v1"
+)
+
+const (
+	// RuntimeLinuxV1 is the legacy linux runtime
+	RuntimeLinuxV1 = "io.containerd.runtime.v1.linux"
+	// RuntimeRuncV1 is the runc runtime that supports a single container
+	RuntimeRuncV1 = "io.containerd.runc.v1"
+	// RuntimeRuncV2 is the runc runtime that supports multiple containers per shim
+	RuntimeRuncV2 = "io.containerd.runc.v2"
 )
 
 // Registration contains information for registering a plugin
@@ -115,6 +122,16 @@ func (r *Registration) URI() string {
 // Service allows GRPC services to be registered with the underlying server
 type Service interface {
 	Register(*grpc.Server) error
+}
+
+// TTRPCService allows TTRPC services to be registered with the underlying server
+type TTRPCService interface {
+	RegisterTTRPC(*ttrpc.Server) error
+}
+
+// TCPService allows GRPC services to be registered with the underlying tcp server
+type TCPService interface {
+	RegisterTCP(*grpc.Server) error
 }
 
 var register = struct {

@@ -41,15 +41,15 @@ import (
 type execProcess struct {
 	wg sync.WaitGroup
 
-	proc.State
+	execState execState
 
 	mu      sync.Mutex
 	id      string
 	console console.Console
-	io      runc.IO
+	io      *processIO
 	status  int
 	exited  time.Time
-	pid     int
+	pid     *safePid
 	closers []io.Closer
 	stdin   io.Closer
 	stdio   proc.Stdio
@@ -69,9 +69,7 @@ func (e *execProcess) ID() string {
 }
 
 func (e *execProcess) Pid() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.pid
+	return e.pid.get()
 }
 
 func (e *execProcess) ExitStatus() int {
@@ -86,11 +84,25 @@ func (e *execProcess) ExitedAt() time.Time {
 	return e.exited
 }
 
+func (e *execProcess) SetExited(status int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.execState.SetExited(status)
+}
+
 func (e *execProcess) setExited(status int) {
 	e.status = status
 	e.exited = time.Now()
 	e.parent.Platform.ShutdownConsole(context.Background(), e.console)
 	close(e.waitBlock)
+}
+
+func (e *execProcess) Delete(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.execState.Delete(ctx)
 }
 
 func (e *execProcess) delete(ctx context.Context) error {
@@ -107,6 +119,13 @@ func (e *execProcess) delete(ctx context.Context) error {
 	return nil
 }
 
+func (e *execProcess) Resize(ws console.WinSize) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.execState.Resize(ws)
+}
+
 func (e *execProcess) resize(ws console.WinSize) error {
 	if e.console == nil {
 		return nil
@@ -114,8 +133,15 @@ func (e *execProcess) resize(ws console.WinSize) error {
 	return e.console.Resize(ws)
 }
 
+func (e *execProcess) Kill(ctx context.Context, sig uint32, _ bool) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.execState.Kill(ctx, sig, false)
+}
+
 func (e *execProcess) kill(ctx context.Context, sig uint32, _ bool) error {
-	pid := e.pid
+	pid := e.pid.get()
 	if pid != 0 {
 		if err := unix.Kill(pid, syscall.Signal(sig)); err != nil {
 			return errors.Wrapf(checkKillError(err), "exec kill error")
@@ -132,29 +158,43 @@ func (e *execProcess) Stdio() proc.Stdio {
 	return e.stdio
 }
 
+func (e *execProcess) Start(ctx context.Context) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	return e.execState.Start(ctx)
+}
+
 func (e *execProcess) start(ctx context.Context) (err error) {
+	// The reaper may receive exit signal right after
+	// the container is started, before the e.pid is updated.
+	// In that case, we want to block the signal handler to
+	// access e.pid until it is updated.
+	e.pid.Lock()
+	defer e.pid.Unlock()
+
 	var (
 		socket  *runc.Socket
-		pidfile = filepath.Join(e.path, fmt.Sprintf("%s.pid", e.id))
+		pio     *processIO
+		pidFile = newExecPidFile(e.path, e.id)
 	)
 	if e.stdio.Terminal {
 		if socket, err = runc.NewTempConsoleSocket(); err != nil {
 			return errors.Wrap(err, "failed to create runc console socket")
 		}
 		defer socket.Close()
-	} else if e.stdio.IsNull() {
-		if e.io, err = runc.NewNullIO(); err != nil {
-			return errors.Wrap(err, "creating new NULL IO")
-		}
 	} else {
-		if e.io, err = runc.NewPipeIO(e.parent.IoUID, e.parent.IoGID); err != nil {
-			return errors.Wrap(err, "failed to create runc io pipes")
+		if pio, err = createIO(ctx, e.id, e.parent.IoUID, e.parent.IoGID, e.stdio); err != nil {
+			return errors.Wrap(err, "failed to create init process I/O")
 		}
+		e.io = pio
 	}
 	opts := &runc.ExecOpts{
-		PidFile: pidfile,
-		IO:      e.io,
+		PidFile: pidFile.Path(),
 		Detach:  true,
+	}
+	if pio != nil {
+		opts.IO = pio.IO()
 	}
 	if socket != nil {
 		opts.ConsoleSocket = socket
@@ -164,39 +204,40 @@ func (e *execProcess) start(ctx context.Context) (err error) {
 		return e.parent.runtimeError(err, "OCI runtime exec failed")
 	}
 	if e.stdio.Stdin != "" {
-		fifoCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-
-		sc, err := fifo.OpenFifo(fifoCtx, e.stdio.Stdin, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
-		if err != nil {
-			return errors.Wrapf(err, "failed to open stdin fifo %s", e.stdio.Stdin)
+		if err := e.openStdin(e.stdio.Stdin); err != nil {
+			return err
 		}
-		e.closers = append(e.closers, sc)
-		e.stdin = sc
 	}
-	var copyWaitGroup sync.WaitGroup
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	if socket != nil {
 		console, err := socket.ReceiveMaster()
 		if err != nil {
 			return errors.Wrap(err, "failed to retrieve console master")
 		}
-		if e.console, err = e.parent.Platform.CopyConsole(ctx, console, e.stdio.Stdin, e.stdio.Stdout, e.stdio.Stderr, &e.wg, &copyWaitGroup); err != nil {
+		if e.console, err = e.parent.Platform.CopyConsole(ctx, console, e.stdio.Stdin, e.stdio.Stdout, e.stdio.Stderr, &e.wg); err != nil {
 			return errors.Wrap(err, "failed to start console copy")
 		}
-	} else if !e.stdio.IsNull() {
-		fifoCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-
-		if err := copyPipes(fifoCtx, e.io, e.stdio.Stdin, e.stdio.Stdout, e.stdio.Stderr, &e.wg, &copyWaitGroup); err != nil {
+	} else {
+		if err := pio.Copy(ctx, &e.wg); err != nil {
 			return errors.Wrap(err, "failed to start io pipe copy")
 		}
 	}
-	copyWaitGroup.Wait()
-	pid, err := runc.ReadPidFile(opts.PidFile)
+	pid, err := pidFile.Read()
 	if err != nil {
 		return errors.Wrap(err, "failed to retrieve OCI runtime exec pid")
 	}
-	e.pid = pid
+	e.pid.pid = pid
+	return nil
+}
+
+func (e *execProcess) openStdin(path string) error {
+	sc, err := fifo.OpenFifo(context.Background(), path, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return errors.Wrapf(err, "failed to open stdin fifo %s", path)
+	}
+	e.stdin = sc
+	e.closers = append(e.closers, sc)
 	return nil
 }
 
@@ -214,11 +255,11 @@ func (e *execProcess) Status(ctx context.Context) (string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	// if we don't have a pid then the exec process has just been created
-	if e.pid == 0 {
+	if e.pid.get() == 0 {
 		return "created", nil
 	}
 	// if we have a pid and it can be signaled, the process is running
-	if err := unix.Kill(e.pid, 0); err == nil {
+	if err := unix.Kill(e.pid.get(), 0); err == nil {
 		return "running", nil
 	}
 	// else if we have a pid but it can nolonger be signaled, it has stopped

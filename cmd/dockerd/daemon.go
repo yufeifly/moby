@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	containerddefaults "github.com/containerd/containerd/defaults"
 	"github.com/docker/distribution/uuid"
 	"github.com/docker/docker/api"
 	apiserver "github.com/docker/docker/api/server"
@@ -20,6 +21,7 @@ import (
 	checkpointrouter "github.com/docker/docker/api/server/router/checkpoint"
 	"github.com/docker/docker/api/server/router/container"
 	distributionrouter "github.com/docker/docker/api/server/router/distribution"
+	grpcrouter "github.com/docker/docker/api/server/router/grpc"
 	"github.com/docker/docker/api/server/router/image"
 	"github.com/docker/docker/api/server/router/network"
 	pluginrouter "github.com/docker/docker/api/server/router/plugin"
@@ -27,7 +29,6 @@ import (
 	swarmrouter "github.com/docker/docker/api/server/router/swarm"
 	systemrouter "github.com/docker/docker/api/server/router/system"
 	"github.com/docker/docker/api/server/router/volume"
-	"github.com/docker/docker/api/types"
 	buildkit "github.com/docker/docker/builder/builder-next"
 	"github.com/docker/docker/builder/dockerfile"
 	"github.com/docker/docker/builder/fscache"
@@ -40,12 +41,14 @@ import (
 	"github.com/docker/docker/libcontainerd/supervisor"
 	dopts "github.com/docker/docker/opts"
 	"github.com/docker/docker/pkg/authorization"
+	"github.com/docker/docker/pkg/homedir"
 	"github.com/docker/docker/pkg/jsonmessage"
 	"github.com/docker/docker/pkg/pidfile"
 	"github.com/docker/docker/pkg/plugingetter"
 	"github.com/docker/docker/pkg/signal"
 	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/plugin"
+	"github.com/docker/docker/rootless"
 	"github.com/docker/docker/runconfig"
 	"github.com/docker/go-connections/tlsconfig"
 	swarmapi "github.com/docker/swarmkit/api"
@@ -83,6 +86,11 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	if cli.Config, err = loadDaemonCliConfig(opts); err != nil {
 		return err
 	}
+
+	if err := configureDaemonLogs(cli.Config); err != nil {
+		return err
+	}
+
 	cli.configFile = &opts.configFile
 	cli.flags = opts.flags
 
@@ -92,13 +100,24 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	if cli.Config.Experimental {
 		logrus.Warn("Running experimental build")
+		if cli.Config.IsRootless() {
+			logrus.Warn("Running in rootless mode. Cgroups, AppArmor, and CRIU are disabled.")
+		}
+		if rootless.RunningWithRootlessKit() {
+			logrus.Info("Running with RootlessKit integration")
+			if !cli.Config.IsRootless() {
+				return fmt.Errorf("rootless mode needs to be enabled for running with RootlessKit")
+			}
+		}
+	} else {
+		if cli.Config.IsRootless() {
+			return fmt.Errorf("rootless mode is supported only when running in experimental mode")
+		}
 	}
-
-	logrus.SetFormatter(&logrus.TextFormatter{
-		TimestampFormat: jsonmessage.RFC3339NanoFixed,
-		DisableColors:   cli.Config.RawLogs,
-		FullTimestamp:   true,
-	})
+	// return human-friendly error before creating files
+	if runtime.GOOS == "linux" && os.Geteuid() != 0 {
+		return fmt.Errorf("dockerd needs to be started with root. To see how to run dockerd in rootless mode with unprivileged user, see the documentation")
+	}
 
 	system.InitLCOW(cli.Config.Experimental)
 
@@ -116,16 +135,27 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 		return err
 	}
 
+	potentiallyUnderRuntimeDir := []string{cli.Config.ExecRoot}
+
 	if cli.Pidfile != "" {
 		pf, err := pidfile.New(cli.Pidfile)
 		if err != nil {
 			return errors.Wrap(err, "failed to start daemon")
 		}
+		potentiallyUnderRuntimeDir = append(potentiallyUnderRuntimeDir, cli.Pidfile)
 		defer func() {
 			if err := pf.Remove(); err != nil {
 				logrus.Error(err)
 			}
 		}()
+	}
+
+	if cli.Config.IsRootless() {
+		// Set sticky bit if XDG_RUNTIME_DIR is set && the file is actually under XDG_RUNTIME_DIR
+		if _, err := homedir.StickRuntimeDirContents(potentiallyUnderRuntimeDir); err != nil {
+			// StickRuntimeDirContents returns nil error if XDG_RUNTIME_DIR is just unset
+			logrus.WithError(err).Warn("cannot set sticky bit on files under XDG_RUNTIME_DIR")
+		}
 	}
 
 	serverConfig, err := newAPIServerConfig(cli)
@@ -140,23 +170,13 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	if cli.Config.ContainerdAddr == "" && runtime.GOOS != "windows" {
-		opts, err := cli.getContainerdDaemonOpts()
-		if err != nil {
-			cancel()
-			return errors.Wrap(err, "failed to generate containerd options")
-		}
-
-		r, err := supervisor.Start(ctx, filepath.Join(cli.Config.Root, "containerd"), filepath.Join(cli.Config.ExecRoot, "containerd"), opts...)
-		if err != nil {
-			cancel()
-			return errors.Wrap(err, "failed to start containerd")
-		}
-
-		cli.Config.ContainerdAddr = r.Address()
-
-		// Try to wait for containerd to shutdown
-		defer r.WaitTimeout(10 * time.Second)
+	waitForContainerDShutdown, err := cli.initContainerD(ctx)
+	if waitForContainerDShutdown != nil {
+		defer waitForContainerDShutdown(10 * time.Second)
+	}
+	if err != nil {
+		cancel()
+		return err
 	}
 	defer cancel()
 
@@ -181,7 +201,7 @@ func (cli *DaemonCli) start(opts *daemonOptions) (err error) {
 
 	d.StoreHosts(hosts)
 
-	// validate after NewDaemon has restored enabled plugins. Dont change order.
+	// validate after NewDaemon has restored enabled plugins. Don't change order.
 	if err := validateAuthzPlugins(cli.Config.AuthorizationPlugins, pluginStore); err != nil {
 		return errors.Wrap(err, "failed to validate authorization plugin")
 	}
@@ -253,14 +273,14 @@ type routerOptions struct {
 	sessionManager *session.Manager
 	buildBackend   *buildbackend.Backend
 	buildCache     *fscache.FSCache // legacy
+	features       *map[string]bool
 	buildkit       *buildkit.Builder
-	builderVersion types.BuilderVersion
 	daemon         *daemon.Daemon
 	api            *apiserver.Server
 	cluster        *cluster.Cluster
 }
 
-func newRouterOptions(config *config.Config, daemon *daemon.Daemon) (routerOptions, error) {
+func newRouterOptions(config *config.Config, d *daemon.Daemon) (routerOptions, error) {
 	opts := routerOptions{}
 	sm, err := session.NewManager()
 	if err != nil {
@@ -281,40 +301,36 @@ func newRouterOptions(config *config.Config, daemon *daemon.Daemon) (routerOptio
 		return opts, errors.Wrap(err, "failed to create fscache")
 	}
 
-	manager, err := dockerfile.NewBuildManager(daemon.BuilderBackend(), sm, buildCache, daemon.IdentityMapping())
+	manager, err := dockerfile.NewBuildManager(d.BuilderBackend(), sm, buildCache, d.IdentityMapping())
 	if err != nil {
 		return opts, err
 	}
+	cgroupParent := newCgroupParent(config)
 	bk, err := buildkit.New(buildkit.Opt{
-		SessionManager:    sm,
-		Root:              filepath.Join(config.Root, "buildkit"),
-		NetnsRoot:         filepath.Join(config.ExecRoot, "netns"),
-		Dist:              daemon.DistributionServices(),
-		NetworkController: daemon.NetworkController(),
+		SessionManager:      sm,
+		Root:                filepath.Join(config.Root, "buildkit"),
+		Dist:                d.DistributionServices(),
+		NetworkController:   d.NetworkController(),
+		DefaultCgroupParent: cgroupParent,
+		ResolverOpt:         d.NewResolveOptionsFunc(),
+		BuilderConfig:       config.Builder,
+		Rootless:            d.Rootless(),
 	})
 	if err != nil {
 		return opts, err
 	}
 
-	bb, err := buildbackend.NewBackend(daemon.ImageService(), manager, buildCache, bk)
+	bb, err := buildbackend.NewBackend(d.ImageService(), manager, buildCache, bk)
 	if err != nil {
 		return opts, errors.Wrap(err, "failed to create buildmanager")
-	}
-	var bv types.BuilderVersion
-	if v, ok := config.Features["buildkit"]; ok {
-		if v {
-			bv = types.BuilderBuildKit
-		} else {
-			bv = types.BuilderV1
-		}
 	}
 	return routerOptions{
 		sessionManager: sm,
 		buildBackend:   bb,
 		buildCache:     buildCache,
 		buildkit:       bk,
-		builderVersion: bv,
-		daemon:         daemon,
+		features:       d.Features(),
+		daemon:         d,
 	}, nil
 }
 
@@ -405,12 +421,6 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 		conf.CommonTLSOptions.KeyFile = opts.TLSOptions.KeyFile
 	}
 
-	if conf.TrustKeyPath == "" {
-		conf.TrustKeyPath = filepath.Join(
-			getDaemonConfDir(conf.Root),
-			defaultTrustKeyFile)
-	}
-
 	if flags.Changed("graph") && flags.Changed("data-root") {
 		return nil, errors.New(`cannot specify both "--graph" and "--data-root" option`)
 	}
@@ -431,17 +441,6 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 
 	if err := config.Validate(conf); err != nil {
 		return nil, err
-	}
-
-	if runtime.GOOS != "windows" {
-		if flags.Changed("disable-legacy-registry") {
-			// TODO: Remove this error after 3 release cycles (18.03)
-			return nil, errors.New("ERROR: The '--disable-legacy-registry' flag has been removed. Interacting with legacy (v1) registries is no longer supported")
-		}
-		if !conf.V2Only {
-			// TODO: Remove this error after 3 release cycles (18.03)
-			return nil, errors.New("ERROR: The 'disable-legacy-registry' configuration option has been removed. Interacting with legacy (v1) registries is no longer supported")
-		}
 	}
 
 	if flags.Changed("graph") {
@@ -473,9 +472,6 @@ func loadDaemonCliConfig(opts *daemonOptions) (*config.Config, error) {
 		conf.TLS = true
 	}
 
-	// ensure that the log level is the one set after merging configurations
-	setLogLevel(conf.LogLevel)
-
 	return conf, nil
 }
 
@@ -487,13 +483,23 @@ func initRouter(opts routerOptions) {
 		checkpointrouter.NewRouter(opts.daemon, decoder),
 		container.NewRouter(opts.daemon, decoder),
 		image.NewRouter(opts.daemon.ImageService()),
-		systemrouter.NewRouter(opts.daemon, opts.cluster, opts.buildCache, opts.buildkit, opts.builderVersion),
+		systemrouter.NewRouter(opts.daemon, opts.cluster, opts.buildCache, opts.buildkit, opts.features),
 		volume.NewRouter(opts.daemon.VolumesService()),
-		build.NewRouter(opts.buildBackend, opts.daemon, opts.builderVersion),
+		build.NewRouter(opts.buildBackend, opts.daemon, opts.features),
 		sessionrouter.NewRouter(opts.sessionManager),
 		swarmrouter.NewRouter(opts.cluster),
 		pluginrouter.NewRouter(opts.daemon.PluginManager()),
 		distributionrouter.NewRouter(opts.daemon.ImageService()),
+	}
+
+	grpcBackends := []grpcrouter.Backend{}
+	for _, b := range []interface{}{opts.daemon, opts.buildBackend} {
+		if b, ok := b.(grpcrouter.Backend); ok {
+			grpcBackends = append(grpcBackends, b)
+		}
+	}
+	if len(grpcBackends) > 0 {
+		routers = append(routers, grpcrouter.NewRouter(grpcBackends...))
 	}
 
 	if opts.daemon.NetworkControllerEnabled() {
@@ -591,7 +597,7 @@ func loadListeners(cli *DaemonCli, serverConfig *apiserver.Config) ([]string, er
 	var hosts []string
 	for i := 0; i < len(cli.Config.Hosts); i++ {
 		var err error
-		if cli.Config.Hosts[i], err = dopts.ParseHost(cli.Config.TLS, cli.Config.Hosts[i]); err != nil {
+		if cli.Config.Hosts[i], err = dopts.ParseHost(cli.Config.TLS, honorXDG, cli.Config.Hosts[i]); err != nil {
 			return nil, errors.Wrapf(err, "error parsing -H %s", cli.Config.Hosts[i])
 		}
 
@@ -665,5 +671,37 @@ func validateAuthzPlugins(requestedPlugins []string, pg plugingetter.PluginGette
 			return err
 		}
 	}
+	return nil
+}
+
+func systemContainerdRunning(honorXDG bool) (string, bool, error) {
+	addr := containerddefaults.DefaultAddress
+	if honorXDG {
+		runtimeDir, err := homedir.GetRuntimeDir()
+		if err != nil {
+			return "", false, err
+		}
+		addr = filepath.Join(runtimeDir, "containerd", "containerd.sock")
+	}
+	_, err := os.Lstat(addr)
+	return addr, err == nil, nil
+}
+
+// configureDaemonLogs sets the logrus logging level and formatting
+func configureDaemonLogs(conf *config.Config) error {
+	if conf.LogLevel != "" {
+		lvl, err := logrus.ParseLevel(conf.LogLevel)
+		if err != nil {
+			return fmt.Errorf("unable to parse logging level: %s", conf.LogLevel)
+		}
+		logrus.SetLevel(lvl)
+	} else {
+		logrus.SetLevel(logrus.InfoLevel)
+	}
+	logrus.SetFormatter(&logrus.TextFormatter{
+		TimestampFormat: jsonmessage.RFC3339NanoFixed,
+		DisableColors:   conf.RawLogs,
+		FullTimestamp:   true,
+	})
 	return nil
 }

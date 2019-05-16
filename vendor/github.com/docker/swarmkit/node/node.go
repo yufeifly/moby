@@ -2,6 +2,7 @@ package node
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"io/ioutil"
@@ -17,9 +18,9 @@ import (
 	"github.com/docker/swarmkit/ca/keyutils"
 	"github.com/docker/swarmkit/identity"
 
-	"github.com/boltdb/bolt"
 	"github.com/docker/docker/pkg/plugingetter"
-	metrics "github.com/docker/go-metrics"
+	"github.com/docker/go-metrics"
+	"github.com/docker/libnetwork/drivers/overlay/overlayutils"
 	"github.com/docker/swarmkit/agent"
 	"github.com/docker/swarmkit/agent/exec"
 	"github.com/docker/swarmkit/api"
@@ -28,13 +29,14 @@ import (
 	"github.com/docker/swarmkit/ioutils"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager"
+	"github.com/docker/swarmkit/manager/allocator/cnmallocator"
 	"github.com/docker/swarmkit/manager/encryption"
 	"github.com/docker/swarmkit/remotes"
 	"github.com/docker/swarmkit/xnet"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	bolt "go.etcd.io/bbolt"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
@@ -105,12 +107,8 @@ type Config struct {
 	// for connections to the remote API (including the raft service).
 	AdvertiseRemoteAPI string
 
-	// DefaultAddrPool specifies default subnet pool for global scope networks
-	DefaultAddrPool []*net.IPNet
-
-	// SubnetSize specifies the subnet size of the networks created from
-	// the default subnet pool
-	SubnetSize int
+	// NetworkConfig stores network related config for the cluster
+	NetworkConfig *cnmallocator.NetworkConfig
 
 	// Executor specifies the executor to use for the agent.
 	Executor exec.Executor
@@ -164,6 +162,7 @@ type Node struct {
 	manager          *manager.Manager
 	notifyNodeChange chan *agent.NodeChanges // used by the agent to relay node updates from the dispatcher Session stream to (*Node).run
 	unlockKey        []byte
+	vxlanUDPPort     uint32
 }
 
 type lastSeenRole struct {
@@ -272,6 +271,15 @@ func (n *Node) currentRole() api.NodeRole {
 	return currentRole
 }
 
+// configVXLANUDPPort sets vxlan port in libnetwork
+func configVXLANUDPPort(ctx context.Context, vxlanUDPPort uint32) {
+	if err := overlayutils.ConfigVXLANUDPPort(vxlanUDPPort); err != nil {
+		log.G(ctx).WithError(err).Error("failed to configure VXLAN UDP port")
+		return
+	}
+	logrus.Infof("initialized VXLAN UDP port to %d ", vxlanUDPPort)
+}
+
 func (n *Node) run(ctx context.Context) (err error) {
 	defer func() {
 		n.err = err
@@ -361,6 +369,10 @@ func (n *Node) run(ctx context.Context) (err error) {
 				return
 			case nodeChanges := <-n.notifyNodeChange:
 				if nodeChanges.Node != nil {
+					if nodeChanges.Node.VXLANUDPPort != 0 {
+						n.vxlanUDPPort = nodeChanges.Node.VXLANUDPPort
+						configVXLANUDPPort(ctx, n.vxlanUDPPort)
+					}
 					// This is a bit complex to be backward compatible with older CAs that
 					// don't support the Node.Role field. They only use what's presently
 					// called DesiredRole.
@@ -1002,8 +1014,7 @@ func (n *Node) runManager(ctx context.Context, securityConfig *ca.SecurityConfig
 		PluginGetter:     n.config.PluginGetter,
 		RootCAPaths:      rootPaths,
 		FIPS:             n.config.FIPS,
-		DefaultAddrPool:  n.config.DefaultAddrPool,
-		SubnetSize:       n.config.SubnetSize,
+		NetworkConfig:    n.config.NetworkConfig,
 	})
 	if err != nil {
 		return false, err
@@ -1208,19 +1219,16 @@ func (s *persistentRemotes) Observe(peer api.Peer, weight int) {
 	s.c.Broadcast()
 	if err := s.save(); err != nil {
 		logrus.Errorf("error writing cluster state file: %v", err)
-		return
 	}
-	return
 }
+
 func (s *persistentRemotes) Remove(peers ...api.Peer) {
 	s.Lock()
 	defer s.Unlock()
 	s.Remotes.Remove(peers...)
 	if err := s.save(); err != nil {
 		logrus.Errorf("error writing cluster state file: %v", err)
-		return
 	}
-	return
 }
 
 func (s *persistentRemotes) save() error {

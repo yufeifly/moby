@@ -3,11 +3,14 @@ package build
 import (
 	"context"
 	"io/ioutil"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/docker/docker/api/types"
 	dclient "github.com/docker/docker/client"
+	"github.com/docker/docker/internal/test/daemon"
 	"github.com/docker/docker/internal/test/fakecontext"
 	"github.com/docker/docker/internal/test/request"
 	"github.com/moby/buildkit/session"
@@ -19,9 +22,19 @@ import (
 )
 
 func TestBuildWithSession(t *testing.T) {
-	skip.If(t, !testEnv.DaemonInfo.ExperimentalBuild)
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 
-	client := testEnv.APIClient()
+	var client dclient.APIClient
+	if !testEnv.DaemonInfo.ExperimentalBuild {
+		skip.If(t, testEnv.IsRemoteDaemon, "cannot run daemon when remote daemon")
+
+		d := daemon.New(t, daemon.WithExperimental)
+		d.StartWithBusybox(t)
+		defer d.Stop(t)
+		client = d.NewClientT(t)
+	} else {
+		client = testEnv.APIClient()
+	}
 
 	dockerfile := `
 		FROM busybox
@@ -76,7 +89,7 @@ func TestBuildWithSession(t *testing.T) {
 	assert.Check(t, is.Contains(string(outBytes), "Successfully built"))
 	assert.Check(t, is.Equal(strings.Count(string(outBytes), "Using cache"), 4))
 
-	_, err = client.BuildCachePrune(context.TODO())
+	_, err = client.BuildCachePrune(context.TODO(), types.BuildCachePruneOptions{All: true})
 	assert.Check(t, err)
 
 	du, err = client.DiskUsage(context.TODO())
@@ -97,7 +110,9 @@ func testBuildWithSession(t *testing.T, client dclient.APIClient, daemonHost str
 	g, ctx := errgroup.WithContext(ctx)
 
 	g.Go(func() error {
-		return sess.Run(ctx, client.DialSession)
+		return sess.Run(ctx, func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
+			return client.DialHijack(ctx, "/session", "h2c", meta)
+		})
 	})
 
 	g.Go(func() error {

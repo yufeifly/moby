@@ -20,26 +20,26 @@ package proc
 
 import (
 	"context"
-	"sync"
-	"syscall"
 
 	"github.com/containerd/console"
-	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/runtime/proc"
-	"github.com/containerd/fifo"
 	runc "github.com/containerd/go-runc"
 	google_protobuf "github.com/gogo/protobuf/types"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
 type initState interface {
-	proc.State
-
+	Resize(console.WinSize) error
+	Start(context.Context) error
+	Delete(context.Context) error
 	Pause(context.Context) error
 	Resume(context.Context) error
 	Update(context.Context, *google_protobuf.Any) error
 	Checkpoint(context.Context, *CheckpointConfig) error
 	Exec(context.Context, string, *ExecConfig) (proc.Process, error)
+	Kill(context.Context, uint32, bool) error
+	SetExited(int)
 }
 
 type createdState struct {
@@ -61,43 +61,26 @@ func (s *createdState) transition(name string) error {
 }
 
 func (s *createdState) Pause(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot pause task in created state")
 }
 
 func (s *createdState) Resume(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot resume task in created state")
 }
 
-func (s *createdState) Update(context context.Context, r *google_protobuf.Any) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
-	return s.p.update(context, r)
+func (s *createdState) Update(ctx context.Context, r *google_protobuf.Any) error {
+	return s.p.update(ctx, r)
 }
 
-func (s *createdState) Checkpoint(context context.Context, r *CheckpointConfig) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
+func (s *createdState) Checkpoint(ctx context.Context, r *CheckpointConfig) error {
 	return errors.Errorf("cannot checkpoint a task in created state")
 }
 
 func (s *createdState) Resize(ws console.WinSize) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.resize(ws)
 }
 
 func (s *createdState) Start(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
 	if err := s.p.start(ctx); err != nil {
 		return err
 	}
@@ -105,8 +88,6 @@ func (s *createdState) Start(ctx context.Context) error {
 }
 
 func (s *createdState) Delete(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
 	if err := s.p.delete(ctx); err != nil {
 		return err
 	}
@@ -114,16 +95,10 @@ func (s *createdState) Delete(ctx context.Context) error {
 }
 
 func (s *createdState) Kill(ctx context.Context, sig uint32, all bool) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.kill(ctx, sig, all)
 }
 
 func (s *createdState) SetExited(status int) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	s.p.setExited(status)
 
 	if err := s.transition("stopped"); err != nil {
@@ -132,8 +107,6 @@ func (s *createdState) SetExited(status int) {
 }
 
 func (s *createdState) Exec(ctx context.Context, path string, r *ExecConfig) (proc.Process, error) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
 	return s.p.exec(ctx, path, r)
 }
 
@@ -157,43 +130,26 @@ func (s *createdCheckpointState) transition(name string) error {
 }
 
 func (s *createdCheckpointState) Pause(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot pause task in created state")
 }
 
 func (s *createdCheckpointState) Resume(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot resume task in created state")
 }
 
-func (s *createdCheckpointState) Update(context context.Context, r *google_protobuf.Any) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
-	return s.p.update(context, r)
+func (s *createdCheckpointState) Update(ctx context.Context, r *google_protobuf.Any) error {
+	return s.p.update(ctx, r)
 }
 
-func (s *createdCheckpointState) Checkpoint(context context.Context, r *CheckpointConfig) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
+func (s *createdCheckpointState) Checkpoint(ctx context.Context, r *CheckpointConfig) error {
 	return errors.Errorf("cannot checkpoint a task in created state")
 }
 
 func (s *createdCheckpointState) Resize(ws console.WinSize) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.resize(ws)
 }
 
 func (s *createdCheckpointState) Start(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
 	p := s.p
 	sio := p.stdio
 
@@ -213,31 +169,25 @@ func (s *createdCheckpointState) Start(ctx context.Context) error {
 		return p.runtimeError(err, "OCI runtime restore failed")
 	}
 	if sio.Stdin != "" {
-		sc, err := fifo.OpenFifo(ctx, sio.Stdin, syscall.O_WRONLY|syscall.O_NONBLOCK, 0)
-		if err != nil {
+		if err := p.openStdin(sio.Stdin); err != nil {
 			return errors.Wrapf(err, "failed to open stdin fifo %s", sio.Stdin)
 		}
-		p.stdin = sc
-		p.closers = append(p.closers, sc)
 	}
-	var copyWaitGroup sync.WaitGroup
 	if socket != nil {
 		console, err := socket.ReceiveMaster()
 		if err != nil {
 			return errors.Wrap(err, "failed to retrieve console master")
 		}
-		console, err = p.Platform.CopyConsole(ctx, console, sio.Stdin, sio.Stdout, sio.Stderr, &p.wg, &copyWaitGroup)
+		console, err = p.Platform.CopyConsole(ctx, console, sio.Stdin, sio.Stdout, sio.Stderr, &p.wg)
 		if err != nil {
 			return errors.Wrap(err, "failed to start console copy")
 		}
 		p.console = console
-	} else if !sio.IsNull() {
-		if err := copyPipes(ctx, p.io, sio.Stdin, sio.Stdout, sio.Stderr, &p.wg, &copyWaitGroup); err != nil {
+	} else {
+		if err := p.io.Copy(ctx, &p.wg); err != nil {
 			return errors.Wrap(err, "failed to start io pipe copy")
 		}
 	}
-
-	copyWaitGroup.Wait()
 	pid, err := runc.ReadPidFile(s.opts.PidFile)
 	if err != nil {
 		return errors.Wrap(err, "failed to retrieve OCI runtime container pid")
@@ -247,8 +197,6 @@ func (s *createdCheckpointState) Start(ctx context.Context) error {
 }
 
 func (s *createdCheckpointState) Delete(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
 	if err := s.p.delete(ctx); err != nil {
 		return err
 	}
@@ -256,16 +204,10 @@ func (s *createdCheckpointState) Delete(ctx context.Context) error {
 }
 
 func (s *createdCheckpointState) Kill(ctx context.Context, sig uint32, all bool) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.kill(ctx, sig, all)
 }
 
 func (s *createdCheckpointState) SetExited(status int) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	s.p.setExited(status)
 
 	if err := s.transition("stopped"); err != nil {
@@ -274,9 +216,6 @@ func (s *createdCheckpointState) SetExited(status int) {
 }
 
 func (s *createdCheckpointState) Exec(ctx context.Context, path string, r *ExecConfig) (proc.Process, error) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return nil, errors.Errorf("cannot exec in a created state")
 }
 
@@ -297,67 +236,42 @@ func (s *runningState) transition(name string) error {
 }
 
 func (s *runningState) Pause(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-	if err := s.p.pause(ctx); err != nil {
-		return err
+	if err := s.p.runtime.Pause(ctx, s.p.id); err != nil {
+		return s.p.runtimeError(err, "OCI runtime pause failed")
 	}
+
 	return s.transition("paused")
 }
 
 func (s *runningState) Resume(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot resume a running process")
 }
 
-func (s *runningState) Update(context context.Context, r *google_protobuf.Any) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
-	return s.p.update(context, r)
+func (s *runningState) Update(ctx context.Context, r *google_protobuf.Any) error {
+	return s.p.update(ctx, r)
 }
 
 func (s *runningState) Checkpoint(ctx context.Context, r *CheckpointConfig) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.checkpoint(ctx, r)
 }
 
 func (s *runningState) Resize(ws console.WinSize) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.resize(ws)
 }
 
 func (s *runningState) Start(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot start a running process")
 }
 
 func (s *runningState) Delete(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot delete a running process")
 }
 
 func (s *runningState) Kill(ctx context.Context, sig uint32, all bool) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.kill(ctx, sig, all)
 }
 
 func (s *runningState) SetExited(status int) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	s.p.setExited(status)
 
 	if err := s.transition("stopped"); err != nil {
@@ -366,8 +280,6 @@ func (s *runningState) SetExited(status int) {
 }
 
 func (s *runningState) Exec(ctx context.Context, path string, r *ExecConfig) (proc.Process, error) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
 	return s.p.exec(ctx, path, r)
 }
 
@@ -388,69 +300,47 @@ func (s *pausedState) transition(name string) error {
 }
 
 func (s *pausedState) Pause(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot pause a paused container")
 }
 
 func (s *pausedState) Resume(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
-	if err := s.p.resume(ctx); err != nil {
-		return err
+	if err := s.p.runtime.Resume(ctx, s.p.id); err != nil {
+		return s.p.runtimeError(err, "OCI runtime resume failed")
 	}
+
 	return s.transition("running")
 }
 
-func (s *pausedState) Update(context context.Context, r *google_protobuf.Any) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
-	return s.p.update(context, r)
+func (s *pausedState) Update(ctx context.Context, r *google_protobuf.Any) error {
+	return s.p.update(ctx, r)
 }
 
 func (s *pausedState) Checkpoint(ctx context.Context, r *CheckpointConfig) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.checkpoint(ctx, r)
 }
 
 func (s *pausedState) Resize(ws console.WinSize) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.resize(ws)
 }
 
 func (s *pausedState) Start(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot start a paused process")
 }
 
 func (s *pausedState) Delete(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot delete a paused process")
 }
 
 func (s *pausedState) Kill(ctx context.Context, sig uint32, all bool) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return s.p.kill(ctx, sig, all)
 }
 
 func (s *pausedState) SetExited(status int) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	s.p.setExited(status)
+
+	if err := s.p.runtime.Resume(context.Background(), s.p.id); err != nil {
+		logrus.WithError(err).Error("resuming exited container from paused state")
+	}
 
 	if err := s.transition("stopped"); err != nil {
 		panic(err)
@@ -458,9 +348,6 @@ func (s *pausedState) SetExited(status int) {
 }
 
 func (s *pausedState) Exec(ctx context.Context, path string, r *ExecConfig) (proc.Process, error) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return nil, errors.Errorf("cannot exec in a paused state")
 }
 
@@ -479,50 +366,30 @@ func (s *stoppedState) transition(name string) error {
 }
 
 func (s *stoppedState) Pause(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot pause a stopped container")
 }
 
 func (s *stoppedState) Resume(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot resume a stopped container")
 }
 
-func (s *stoppedState) Update(context context.Context, r *google_protobuf.Any) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
+func (s *stoppedState) Update(ctx context.Context, r *google_protobuf.Any) error {
 	return errors.Errorf("cannot update a stopped container")
 }
 
 func (s *stoppedState) Checkpoint(ctx context.Context, r *CheckpointConfig) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot checkpoint a stopped container")
 }
 
 func (s *stoppedState) Resize(ws console.WinSize) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot resize a stopped container")
 }
 
 func (s *stoppedState) Start(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return errors.Errorf("cannot start a stopped process")
 }
 
 func (s *stoppedState) Delete(ctx context.Context) error {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
 	if err := s.p.delete(ctx); err != nil {
 		return err
 	}
@@ -530,7 +397,7 @@ func (s *stoppedState) Delete(ctx context.Context) error {
 }
 
 func (s *stoppedState) Kill(ctx context.Context, sig uint32, all bool) error {
-	return errdefs.ToGRPCf(errdefs.ErrNotFound, "process %s not found", s.p.id)
+	return s.p.kill(ctx, sig, all)
 }
 
 func (s *stoppedState) SetExited(status int) {
@@ -538,8 +405,5 @@ func (s *stoppedState) SetExited(status int) {
 }
 
 func (s *stoppedState) Exec(ctx context.Context, path string, r *ExecConfig) (proc.Process, error) {
-	s.p.mu.Lock()
-	defer s.p.mu.Unlock()
-
 	return nil, errors.Errorf("cannot exec in a stopped state")
 }

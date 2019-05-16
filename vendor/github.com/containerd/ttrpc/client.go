@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/pkg/errors"
@@ -86,6 +87,10 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp int
 		cresp = &Response{}
 	)
 
+	if dl, ok := ctx.Deadline(); ok {
+		creq.TimeoutNano = dl.Sub(time.Now()).Nanoseconds()
+	}
+
 	if err := c.dispatch(ctx, creq, cresp); err != nil {
 		return err
 	}
@@ -104,18 +109,23 @@ func (c *Client) Call(ctx context.Context, service, method string, req, resp int
 func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) error {
 	errs := make(chan error, 1)
 	call := &callRequest{
+		ctx:  ctx,
 		req:  req,
 		resp: resp,
 		errs: errs,
 	}
 
 	select {
+	case <-ctx.Done():
+		return ctx.Err()
 	case c.calls <- call:
 	case <-c.done:
 		return c.err
 	}
 
 	select {
+	case <-ctx.Done():
+		return ctx.Err()
 	case err := <-errs:
 		return filterCloseErr(err)
 	case <-c.done:

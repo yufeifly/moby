@@ -72,7 +72,7 @@ func (daemon *Daemon) getIpcContainer(id string) (*container.Container, error) {
 	// Check the container ipc is shareable
 	if st, err := os.Stat(container.ShmPath); err != nil || !st.IsDir() {
 		if err == nil || os.IsNotExist(err) {
-			return nil, errors.New(errMsg + ": non-shareable IPC")
+			return nil, errors.New(errMsg + ": non-shareable IPC (hint: use IpcMode:shareable for the donor container)")
 		}
 		// stat() failed?
 		return nil, errors.Wrap(err, errMsg+": unexpected error from stat "+container.ShmPath)
@@ -230,7 +230,14 @@ func (daemon *Daemon) setupSecretDir(c *container.Container) (setupErr error) {
 	for _, ref := range c.ConfigReferences {
 		// TODO (ehazlett): use type switch when more are supported
 		if ref.File == nil {
-			logrus.Error("config target type is not a file target")
+			// Runtime configs are not mounted into the container, but they're
+			// a valid type of config so we should not error when we encounter
+			// one.
+			if ref.Runtime == nil {
+				logrus.Error("config target type is not a file or runtime target")
+			}
+			// However, in any case, this isn't a file config, so we have no
+			// further work to do
 			continue
 		}
 
@@ -351,10 +358,6 @@ func killProcessDirectly(cntr *container.Container) error {
 	return nil
 }
 
-func detachMounted(path string) error {
-	return unix.Unmount(path, unix.MNT_DETACH)
-}
-
 func isLinkable(child *container.Container) bool {
 	// A container is linkable only if it belongs to the default network
 	_, ok := child.NetworkSettings.Networks[runconfig.DefaultDaemonNetworkMode().NetworkName()]
@@ -365,8 +368,9 @@ func enableIPOnPredefinedNetwork() bool {
 	return false
 }
 
-func (daemon *Daemon) isNetworkHotPluggable() bool {
-	return true
+// serviceDiscoveryOnDefaultNetwork indicates if service discovery is supported on the default network
+func serviceDiscoveryOnDefaultNetwork() bool {
+	return false
 }
 
 func (daemon *Daemon) setupPathsAndSandboxOptions(container *container.Container, sboxOptions *[]libnetwork.SandboxOption) error {
@@ -375,10 +379,10 @@ func (daemon *Daemon) setupPathsAndSandboxOptions(container *container.Container
 	if container.HostConfig.NetworkMode.IsHost() {
 		// Point to the host files, so that will be copied into the container running in host mode
 		*sboxOptions = append(*sboxOptions, libnetwork.OptionOriginHostsPath("/etc/hosts"))
-		*sboxOptions = append(*sboxOptions, libnetwork.OptionOriginResolvConfPath("/etc/resolv.conf"))
-	} else {
-		*sboxOptions = append(*sboxOptions, libnetwork.OptionOriginResolvConfPath(daemon.configStore.GetResolvConf()))
 	}
+
+	// Copy the host's resolv.conf for the container (/etc/resolv.conf or /run/systemd/resolve/resolv.conf)
+	*sboxOptions = append(*sboxOptions, libnetwork.OptionOriginResolvConfPath(daemon.configStore.GetResolvConf()))
 
 	container.HostsPath, err = container.GetRootResourcePath("hosts")
 	if err != nil {

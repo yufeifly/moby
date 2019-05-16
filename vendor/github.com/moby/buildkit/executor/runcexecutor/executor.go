@@ -11,12 +11,13 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
-	"github.com/containerd/containerd/contrib/seccomp"
 	"github.com/containerd/containerd/mount"
 	containerdoci "github.com/containerd/containerd/oci"
 	"github.com/containerd/continuity/fs"
 	runc "github.com/containerd/go-runc"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/executor"
 	"github.com/moby/buildkit/executor/oci"
@@ -24,7 +25,6 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/network"
 	rootlessspecconv "github.com/moby/buildkit/util/rootless/specconv"
-	"github.com/moby/buildkit/util/system"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -36,6 +36,13 @@ type Opt struct {
 	CommandCandidates []string
 	// without root privileges (has nothing to do with Opt.Root directory)
 	Rootless bool
+	// DefaultCgroupParent is the cgroup-parent name for executor
+	DefaultCgroupParent string
+	// ProcessMode
+	ProcessMode     oci.ProcessMode
+	IdentityMapping *idtools.IdentityMapping
+	// runc run --no-pivot (unrecommended)
+	NoPivot bool
 }
 
 var defaultCommandCandidates = []string{"buildkit-runc", "runc"}
@@ -44,8 +51,12 @@ type runcExecutor struct {
 	runc             *runc.Runc
 	root             string
 	cmd              string
+	cgroupParent     string
 	rootless         bool
 	networkProviders map[pb.NetMode]network.Provider
+	processMode      oci.ProcessMode
+	idmap            *idtools.IdentityMapping
+	noPivot          bool
 }
 
 func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Executor, error) {
@@ -81,11 +92,15 @@ func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Ex
 		return nil, err
 	}
 
+	// clean up old hosts/resolv.conf file. ignore errors
+	os.RemoveAll(filepath.Join(root, "hosts"))
+	os.RemoveAll(filepath.Join(root, "resolv.conf"))
+
 	runtime := &runc.Runc{
 		Command:      cmd,
 		Log:          filepath.Join(root, "runc-log.json"),
 		LogFormat:    runc.JSON,
-		PdeathSignal: syscall.SIGKILL,
+		PdeathSignal: syscall.SIGKILL, // this can still leak the process
 		Setpgid:      true,
 		// we don't execute runc with --rootless=(true|false) explicitly,
 		// so as to support non-runc runtimes
@@ -94,8 +109,12 @@ func New(opt Opt, networkProviders map[pb.NetMode]network.Provider) (executor.Ex
 	w := &runcExecutor{
 		runc:             runtime,
 		root:             root,
+		cgroupParent:     opt.DefaultCgroupParent,
 		rootless:         opt.Rootless,
 		networkProviders: networkProviders,
+		processMode:      opt.ProcessMode,
+		idmap:            opt.IdentityMapping,
+		noPivot:          opt.NoPivot,
 	}
 	return w, nil
 }
@@ -146,8 +165,14 @@ func (w *runcExecutor) Exec(ctx context.Context, meta executor.Meta, root cache.
 		return err
 	}
 	defer os.RemoveAll(bundle)
+
+	identity := idtools.Identity{}
+	if w.idmap != nil {
+		identity = w.idmap.RootPair()
+	}
+
 	rootFSPath := filepath.Join(bundle, "rootfs")
-	if err := os.Mkdir(rootFSPath, 0700); err != nil {
+	if err := idtools.MkdirAllAndChown(rootFSPath, 0700, identity); err != nil {
 		return err
 	}
 	if err := mount.All(rootMount, rootFSPath); err != nil {
@@ -167,13 +192,33 @@ func (w *runcExecutor) Exec(ctx context.Context, meta executor.Meta, root cache.
 	defer f.Close()
 
 	opts := []containerdoci.SpecOpts{oci.WithUIDGID(uid, gid, sgids)}
-	if system.SeccompSupported() {
-		opts = append(opts, seccomp.WithDefaultProfile())
-	}
+
 	if meta.ReadonlyRootFS {
 		opts = append(opts, containerdoci.WithRootFSReadonly())
 	}
-	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, opts...)
+
+	identity = idtools.Identity{
+		UID: int(uid),
+		GID: int(gid),
+	}
+	if w.idmap != nil {
+		identity, err = w.idmap.ToHost(identity)
+		if err != nil {
+			return err
+		}
+	}
+
+	if w.cgroupParent != "" {
+		var cgroupsPath string
+		lastSeparator := w.cgroupParent[len(w.cgroupParent)-1:]
+		if strings.Contains(w.cgroupParent, ".slice") && lastSeparator == ":" {
+			cgroupsPath = w.cgroupParent + id
+		} else {
+			cgroupsPath = filepath.Join("/", w.cgroupParent, "buildkit", id)
+		}
+		opts = append(opts, containerdoci.WithCgroup(cgroupsPath))
+	}
+	spec, cleanup, err := oci.GenerateSpec(ctx, meta, mounts, id, resolvConf, hostsFile, namespace, w.processMode, w.idmap, opts...)
 	if err != nil {
 		return err
 	}
@@ -188,7 +233,7 @@ func (w *runcExecutor) Exec(ctx context.Context, meta executor.Meta, root cache.
 	if err != nil {
 		return errors.Wrapf(err, "working dir %s points to invalid target", newp)
 	}
-	if err := os.MkdirAll(newp, 0755); err != nil {
+	if err := idtools.MkdirAllAndChown(newp, 0755, identity); err != nil {
 		return errors.Wrapf(err, "failed to create working directory %s", newp)
 	}
 
@@ -205,79 +250,67 @@ func (w *runcExecutor) Exec(ctx context.Context, meta executor.Meta, root cache.
 		return err
 	}
 
-	forwardIO, err := newForwardIO(stdin, stdout, stderr)
-	if err != nil {
-		return errors.Wrap(err, "creating new forwarding IO")
-	}
-	defer forwardIO.Close()
+	// runCtx/killCtx is used for extra check in case the kill command blocks
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				killCtx, timeout := context.WithTimeout(context.Background(), 7*time.Second)
+				if err := w.runc.Kill(killCtx, id, int(syscall.SIGKILL), nil); err != nil {
+					logrus.Errorf("failed to kill runc %s: %+v", id, err)
+					select {
+					case <-killCtx.Done():
+						timeout()
+						cancelRun()
+						return
+					default:
+					}
+				}
+				timeout()
+				select {
+				case <-time.After(50 * time.Millisecond):
+				case <-done:
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
 
 	logrus.Debugf("> creating %s %v", id, meta.Args)
-	status, err := w.runc.Run(ctx, id, bundle, &runc.CreateOpts{
-		IO: forwardIO,
+	status, err := w.runc.Run(runCtx, id, bundle, &runc.CreateOpts{
+		IO:      &forwardIO{stdin: stdin, stdout: stdout, stderr: stderr},
+		NoPivot: w.noPivot,
 	})
+	close(done)
 	if err != nil {
 		return err
 	}
 
 	if status != 0 {
-		return errors.Errorf("exit code: %d", status)
+		err := errors.Errorf("exit code: %d", status)
+		select {
+		case <-ctx.Done():
+			return errors.Wrapf(ctx.Err(), err.Error())
+		default:
+			return err
+		}
 	}
 
 	return nil
 }
 
 type forwardIO struct {
-	stdin, stdout, stderr *os.File
-	toRelease             []io.Closer
-	toClose               []io.Closer
-}
-
-func newForwardIO(stdin io.ReadCloser, stdout, stderr io.WriteCloser) (f *forwardIO, err error) {
-	fio := &forwardIO{}
-	defer func() {
-		if err != nil {
-			fio.Close()
-		}
-	}()
-	if stdin != nil {
-		fio.stdin, err = fio.readCloserToFile(stdin)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if stdout != nil {
-		fio.stdout, err = fio.writeCloserToFile(stdout)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if stderr != nil {
-		fio.stderr, err = fio.writeCloserToFile(stderr)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return fio, nil
+	stdin          io.ReadCloser
+	stdout, stderr io.WriteCloser
 }
 
 func (s *forwardIO) Close() error {
-	s.CloseAfterStart()
-	var err error
-	for _, cl := range s.toClose {
-		if err1 := cl.Close(); err == nil {
-			err = err1
-		}
-	}
-	s.toClose = nil
-	return err
-}
-
-// release releases active FDs if the process doesn't need them any more
-func (s *forwardIO) CloseAfterStart() error {
-	for _, cl := range s.toRelease {
-		cl.Close()
-	}
-	s.toRelease = nil
 	return nil
 }
 
@@ -285,46 +318,6 @@ func (s *forwardIO) Set(cmd *exec.Cmd) {
 	cmd.Stdin = s.stdin
 	cmd.Stdout = s.stdout
 	cmd.Stderr = s.stderr
-}
-
-func (s *forwardIO) readCloserToFile(rc io.ReadCloser) (*os.File, error) {
-	if f, ok := rc.(*os.File); ok {
-		return f, nil
-	}
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	s.toClose = append(s.toClose, pw)
-	s.toRelease = append(s.toRelease, pr)
-	go func() {
-		_, err := io.Copy(pw, rc)
-		if err1 := pw.Close(); err == nil {
-			err = err1
-		}
-		_ = err
-	}()
-	return pr, nil
-}
-
-func (s *forwardIO) writeCloserToFile(wc io.WriteCloser) (*os.File, error) {
-	if f, ok := wc.(*os.File); ok {
-		return f, nil
-	}
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	s.toClose = append(s.toClose, pr)
-	s.toRelease = append(s.toRelease, pw)
-	go func() {
-		_, err := io.Copy(wc, pr)
-		if err1 := pw.Close(); err == nil {
-			err = err1
-		}
-		_ = err
-	}()
-	return pw, nil
 }
 
 func (s *forwardIO) Stdin() io.WriteCloser {

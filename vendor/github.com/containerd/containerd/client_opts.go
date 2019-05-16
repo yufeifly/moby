@@ -89,7 +89,7 @@ type RemoteOpt func(*Client, *RemoteContext) error
 // content for
 func WithPlatform(platform string) RemoteOpt {
 	if platform == "" {
-		platform = platforms.Default()
+		platform = platforms.DefaultString()
 	}
 	return func(_ *Client, c *RemoteContext) error {
 		for _, p := range c.Platforms {
@@ -99,6 +99,16 @@ func WithPlatform(platform string) RemoteOpt {
 		}
 
 		c.Platforms = append(c.Platforms, platform)
+		return nil
+	}
+}
+
+// WithPlatformMatcher specifies the matcher to use for
+// determining which platforms to pull content for.
+// This value supersedes anything set with `WithPlatform`.
+func WithPlatformMatcher(m platforms.MatchComparer) RemoteOpt {
+	return func(_ *Client, c *RemoteContext) error {
+		c.PlatformMatcher = m
 		return nil
 	}
 }
@@ -165,6 +175,31 @@ func WithResolver(resolver remotes.Resolver) RemoteOpt {
 func WithImageHandler(h images.Handler) RemoteOpt {
 	return func(client *Client, c *RemoteContext) error {
 		c.BaseHandlers = append(c.BaseHandlers, h)
+		return nil
+	}
+}
+
+// WithImageHandlerWrapper wraps the handlers to be called on dispatch.
+func WithImageHandlerWrapper(w func(images.Handler) images.Handler) RemoteOpt {
+	return func(client *Client, c *RemoteContext) error {
+		c.HandlerWrapper = w
+		return nil
+	}
+}
+
+// WithMaxConcurrentDownloads sets max concurrent download limit.
+func WithMaxConcurrentDownloads(max int) RemoteOpt {
+	return func(client *Client, c *RemoteContext) error {
+		c.MaxConcurrentDownloads = max
+		return nil
+	}
+}
+
+// WithAppendDistributionSourceLabel allows fetcher to add distribute source
+// label for each blob content, which doesn't work for legacy schema1.
+func WithAppendDistributionSourceLabel() RemoteOpt {
+	return func(_ *Client, c *RemoteContext) error {
+		c.AppendDistributionSourceLabel = true
 		return nil
 	}
 }

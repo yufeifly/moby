@@ -21,11 +21,8 @@ var (
 	keyExtraHost = contextKeyT("llb.exec.extrahost")
 	keyPlatform  = contextKeyT("llb.platform")
 	keyNetwork   = contextKeyT("llb.network")
+	keySecurity  = contextKeyT("llb.security")
 )
-
-func addEnv(key, value string) StateOption {
-	return addEnvf(key, value)
-}
 
 func addEnvf(key, value string, v ...interface{}) StateOption {
 	return func(s State) State {
@@ -152,7 +149,6 @@ func network(v pb.NetMode) StateOption {
 		return s.WithValue(keyNetwork, v)
 	}
 }
-
 func getNetwork(s State) pb.NetMode {
 	v := s.Value(keyNetwork)
 	if v != nil {
@@ -160,6 +156,20 @@ func getNetwork(s State) pb.NetMode {
 		return n
 	}
 	return NetModeSandbox
+}
+
+func security(v pb.SecurityMode) StateOption {
+	return func(s State) State {
+		return s.WithValue(keySecurity, v)
+	}
+}
+func getSecurity(s State) pb.SecurityMode {
+	v := s.Value(keySecurity)
+	if v != nil {
+		n := v.(pb.SecurityMode)
+		return n
+	}
+	return SecurityModeSandbox
 }
 
 type EnvList []KeyValue
@@ -172,6 +182,13 @@ type KeyValue struct {
 func (e EnvList) AddOrReplace(k, v string) EnvList {
 	e = e.Delete(k)
 	e = append(e, KeyValue{key: k, value: v})
+	return e
+}
+
+func (e EnvList) SetDefault(k, v string) EnvList {
+	if _, ok := e.Get(k); !ok {
+		e = append(e, KeyValue{key: k, value: v})
+	}
 	return e
 }
 

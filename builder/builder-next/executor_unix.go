@@ -15,25 +15,28 @@ import (
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/network"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/sirupsen/logrus"
 )
 
 const networkName = "bridge"
 
-func newExecutor(root, netnsRoot string, net libnetwork.NetworkController) (executor.Executor, error) {
+func newExecutor(root, cgroupParent string, net libnetwork.NetworkController, rootless bool) (executor.Executor, error) {
 	networkProviders := map[pb.NetMode]network.Provider{
-		pb.NetMode_UNSET: &bridgeProvider{NetworkController: net, netnsRoot: netnsRoot},
+		pb.NetMode_UNSET: &bridgeProvider{NetworkController: net, Root: filepath.Join(root, "net")},
 		pb.NetMode_HOST:  network.NewHostProvider(),
 		pb.NetMode_NONE:  network.NewNoneProvider(),
 	}
 	return runcexecutor.New(runcexecutor.Opt{
-		Root:              filepath.Join(root, "executor"),
-		CommandCandidates: []string{"docker-runc", "runc"},
+		Root:                filepath.Join(root, "executor"),
+		CommandCandidates:   []string{"runc"},
+		DefaultCgroupParent: cgroupParent,
+		Rootless:            rootless,
 	}, networkProviders)
 }
 
 type bridgeProvider struct {
 	libnetwork.NetworkController
-	netnsRoot string
+	Root string
 }
 
 func (p *bridgeProvider) New() (network.Namespace, error) {
@@ -63,13 +66,14 @@ func (iface *lnInterface) init(c libnetwork.NetworkController, n libnetwork.Netw
 	defer close(iface.ready)
 	id := identity.NewID()
 
-	ep, err := n.CreateEndpoint(id)
+	ep, err := n.CreateEndpoint(id, libnetwork.CreateOptionDisableResolution())
 	if err != nil {
 		iface.err = err
 		return
 	}
 
-	sbx, err := c.NewSandbox(id)
+	sbx, err := c.NewSandbox(id, libnetwork.OptionUseExternalKey(), libnetwork.OptionHostsPath(filepath.Join(iface.provider.Root, id, "hosts")),
+		libnetwork.OptionResolvConfPath(filepath.Join(iface.provider.Root, id, "resolv.conf")))
 	if err != nil {
 		iface.err = err
 		return
@@ -87,23 +91,26 @@ func (iface *lnInterface) init(c libnetwork.NetworkController, n libnetwork.Netw
 func (iface *lnInterface) Set(s *specs.Spec) {
 	<-iface.ready
 	if iface.err != nil {
+		logrus.WithError(iface.err).Error("failed to set networking spec")
 		return
 	}
 	// attach netns to bridge within the container namespace, using reexec in a prestart hook
 	s.Hooks = &specs.Hooks{
 		Prestart: []specs.Hook{{
 			Path: filepath.Join("/proc", strconv.Itoa(os.Getpid()), "exe"),
-			Args: []string{"libnetwork-setkey", iface.sbx.ContainerID(), iface.provider.NetworkController.ID()},
+			Args: []string{"libnetwork-setkey", "-exec-root=" + iface.provider.Config().Daemon.ExecRoot, iface.sbx.ContainerID(), iface.provider.NetworkController.ID()},
 		}},
 	}
 }
 
 func (iface *lnInterface) Close() error {
 	<-iface.ready
-	err := iface.sbx.Delete()
-	if iface.err != nil {
-		// iface.err takes precedence over cleanup errors
-		return iface.err
+	if iface.sbx != nil {
+		go func() {
+			if err := iface.sbx.Delete(); err != nil {
+				logrus.Errorf("failed to delete builder network sandbox: %v", err)
+			}
+		}()
 	}
-	return err
+	return iface.err
 }

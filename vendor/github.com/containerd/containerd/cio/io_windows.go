@@ -17,6 +17,7 @@
 package cio
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -30,11 +31,15 @@ const pipeRoot = `\\.\pipe`
 
 // NewFIFOSetInDir returns a new set of fifos for the task
 func NewFIFOSetInDir(_, id string, terminal bool) (*FIFOSet, error) {
+	stderrPipe := ""
+	if !terminal {
+		stderrPipe = fmt.Sprintf(`%s\ctr-%s-stderr`, pipeRoot, id)
+	}
 	return NewFIFOSet(Config{
 		Terminal: terminal,
 		Stdin:    fmt.Sprintf(`%s\ctr-%s-stdin`, pipeRoot, id),
 		Stdout:   fmt.Sprintf(`%s\ctr-%s-stdout`, pipeRoot, id),
-		Stderr:   fmt.Sprintf(`%s\ctr-%s-stderr`, pipeRoot, id),
+		Stderr:   stderrPipe,
 	}, nil), nil
 }
 
@@ -74,7 +79,7 @@ func copyIO(fifos *FIFOSet, ioset *Streams) (*cio, error) {
 	if fifos.Stdout != "" {
 		l, err := winio.ListenPipe(fifos.Stdout, nil)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to create stdin pipe %s", fifos.Stdout)
+			return nil, errors.Wrapf(err, "failed to create stdout pipe %s", fifos.Stdout)
 		}
 		defer func(l net.Listener) {
 			if err != nil {
@@ -99,7 +104,7 @@ func copyIO(fifos *FIFOSet, ioset *Streams) (*cio, error) {
 		}()
 	}
 
-	if !fifos.Terminal && fifos.Stderr != "" {
+	if fifos.Stderr != "" {
 		l, err := winio.ListenPipe(fifos.Stderr, nil)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to create stderr pipe %s", fifos.Stderr)
@@ -141,6 +146,25 @@ func NewDirectIO(stdin io.WriteCloser, stdout, stderr io.ReadCloser, terminal bo
 		},
 		cio: cio{
 			config: Config{Terminal: terminal},
+		},
+	}
+}
+
+// NewDirectIOFromFIFOSet returns an IO implementation that exposes the IO streams as io.ReadCloser
+// and io.WriteCloser.
+func NewDirectIOFromFIFOSet(ctx context.Context, stdin io.WriteCloser, stdout, stderr io.ReadCloser, fifos *FIFOSet) *DirectIO {
+	_, cancel := context.WithCancel(ctx)
+	pipes := pipes{
+		Stdin:  stdin,
+		Stdout: stdout,
+		Stderr: stderr,
+	}
+	return &DirectIO{
+		pipes: pipes,
+		cio: cio{
+			config:  fifos.Config,
+			closers: append(pipes.closers(), fifos),
+			cancel:  cancel,
 		},
 	}
 }

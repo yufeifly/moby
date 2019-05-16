@@ -9,7 +9,9 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -23,6 +25,8 @@ import (
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/defaults"
 	"github.com/containerd/containerd/pkg/dialer"
+	"github.com/containerd/containerd/remotes/docker"
+	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/swarm"
@@ -36,7 +40,10 @@ import (
 	"github.com/docker/docker/daemon/logger"
 	"github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/errdefs"
+	"github.com/moby/buildkit/util/resolver"
+	"github.com/moby/buildkit/util/tracing"
 	"github.com/sirupsen/logrus"
+
 	// register graph drivers
 	_ "github.com/docker/docker/daemon/graphdriver/register"
 	"github.com/docker/docker/daemon/stats"
@@ -45,7 +52,7 @@ import (
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/libcontainerd"
-	"github.com/docker/docker/migrate/v1"
+	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/locker"
 	"github.com/docker/docker/pkg/plugingetter"
@@ -62,6 +69,7 @@ import (
 	"github.com/docker/libnetwork/cluster"
 	nwconfig "github.com/docker/libnetwork/config"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/semaphore"
 )
 
 // ContainersNamespace is the name of the namespace used for users containers
@@ -100,7 +108,7 @@ type Daemon struct {
 	pluginManager         *plugin.Manager
 	linkIndex             *linkIndex
 	containerdCli         *containerd.Client
-	containerd            libcontainerd.Client
+	containerd            libcontainerdtypes.Client
 	defaultIsolation      containertypes.Isolation // Default isolation mode on Windows
 	clusterProvider       cluster.Provider
 	cluster               Cluster
@@ -136,7 +144,67 @@ func (daemon *Daemon) HasExperimental() bool {
 	return daemon.configStore != nil && daemon.configStore.Experimental
 }
 
+// Features returns the features map from configStore
+func (daemon *Daemon) Features() *map[string]bool {
+	return &daemon.configStore.Features
+}
+
+// NewResolveOptionsFunc returns a call back function to resolve "registry-mirrors" and
+// "insecure-registries" for buildkit
+func (daemon *Daemon) NewResolveOptionsFunc() resolver.ResolveOptionsFunc {
+	return func(ref string) docker.ResolverOptions {
+		var (
+			registryKey = "docker.io"
+			mirrors     = make([]string, len(daemon.configStore.Mirrors))
+			m           = map[string]resolver.RegistryConf{}
+		)
+		// must trim "https://" or "http://" prefix
+		for i, v := range daemon.configStore.Mirrors {
+			if uri, err := url.Parse(v); err == nil {
+				v = uri.Host
+			}
+			mirrors[i] = v
+		}
+		// set "registry-mirrors"
+		m[registryKey] = resolver.RegistryConf{Mirrors: mirrors}
+		// set "insecure-registries"
+		for _, v := range daemon.configStore.InsecureRegistries {
+			if uri, err := url.Parse(v); err == nil {
+				v = uri.Host
+			}
+			m[v] = resolver.RegistryConf{
+				PlainHTTP: true,
+			}
+		}
+		def := docker.ResolverOptions{
+			Client: tracing.DefaultClient,
+		}
+
+		parsed, err := reference.ParseNormalizedNamed(ref)
+		if err != nil {
+			return def
+		}
+		host := reference.Domain(parsed)
+
+		c, ok := m[host]
+		if !ok {
+			return def
+		}
+
+		if len(c.Mirrors) > 0 {
+			def.Host = func(string) (string, error) {
+				return c.Mirrors[rand.Intn(len(c.Mirrors))], nil
+			}
+		}
+
+		def.PlainHTTP = c.PlainHTTP
+
+		return def
+	}
+}
+
 func (daemon *Daemon) restore() error {
+	var mapLock sync.Mutex
 	containers := make(map[string]*container.Container)
 
 	logrus.Info("Loading containers: start.")
@@ -146,68 +214,99 @@ func (daemon *Daemon) restore() error {
 		return err
 	}
 
-	for _, v := range dir {
-		id := v.Name()
-		container, err := daemon.load(id)
-		if err != nil {
-			logrus.Errorf("Failed to load container %v: %v", id, err)
-			continue
-		}
-		if !system.IsOSSupported(container.OS) {
-			logrus.Errorf("Failed to load container %v: %s (%q)", id, system.ErrNotSupportedOperatingSystem, container.OS)
-			continue
-		}
-		// Ignore the container if it does not support the current driver being used by the graph
-		currentDriverForContainerOS := daemon.graphDrivers[container.OS]
-		if (container.Driver == "" && currentDriverForContainerOS == "aufs") || container.Driver == currentDriverForContainerOS {
-			rwlayer, err := daemon.imageService.GetLayerByID(container.ID, container.OS)
-			if err != nil {
-				logrus.Errorf("Failed to load container mount %v: %v", id, err)
-				continue
-			}
-			container.RWLayer = rwlayer
-			logrus.Debugf("Loaded container %v, isRunning: %v", container.ID, container.IsRunning())
+	// parallelLimit is the maximum number of parallel startup jobs that we
+	// allow (this is the limited used for all startup semaphores). The multipler
+	// (128) was chosen after some fairly significant benchmarking -- don't change
+	// it unless you've tested it significantly (this value is adjusted if
+	// RLIMIT_NOFILE is small to avoid EMFILE).
+	parallelLimit := adjustParallelLimit(len(dir), 128*runtime.NumCPU())
 
-			containers[container.ID] = container
-		} else {
-			logrus.Debugf("Cannot load container %s because it was created with another graph driver.", container.ID)
-		}
+	// Re-used for all parallel startup jobs.
+	var group sync.WaitGroup
+	sem := semaphore.NewWeighted(int64(parallelLimit))
+
+	for _, v := range dir {
+		group.Add(1)
+		go func(id string) {
+			defer group.Done()
+			_ = sem.Acquire(context.Background(), 1)
+			defer sem.Release(1)
+
+			container, err := daemon.load(id)
+			if err != nil {
+				logrus.Errorf("Failed to load container %v: %v", id, err)
+				return
+			}
+			if !system.IsOSSupported(container.OS) {
+				logrus.Errorf("Failed to load container %v: %s (%q)", id, system.ErrNotSupportedOperatingSystem, container.OS)
+				return
+			}
+			// Ignore the container if it does not support the current driver being used by the graph
+			currentDriverForContainerOS := daemon.graphDrivers[container.OS]
+			if (container.Driver == "" && currentDriverForContainerOS == "aufs") || container.Driver == currentDriverForContainerOS {
+				rwlayer, err := daemon.imageService.GetLayerByID(container.ID, container.OS)
+				if err != nil {
+					logrus.Errorf("Failed to load container mount %v: %v", id, err)
+					return
+				}
+				container.RWLayer = rwlayer
+				logrus.Debugf("Loaded container %v, isRunning: %v", container.ID, container.IsRunning())
+
+				mapLock.Lock()
+				containers[container.ID] = container
+				mapLock.Unlock()
+			} else {
+				logrus.Debugf("Cannot load container %s because it was created with another graph driver.", container.ID)
+			}
+		}(v.Name())
 	}
+	group.Wait()
 
 	removeContainers := make(map[string]*container.Container)
 	restartContainers := make(map[*container.Container]chan struct{})
 	activeSandboxes := make(map[string]interface{})
-	for id, c := range containers {
-		if err := daemon.registerName(c); err != nil {
-			logrus.Errorf("Failed to register container name %s: %s", c.ID, err)
-			delete(containers, id)
-			continue
-		}
-		if err := daemon.Register(c); err != nil {
-			logrus.Errorf("Failed to register container %s: %s", c.ID, err)
-			delete(containers, id)
-			continue
-		}
 
-		// The LogConfig.Type is empty if the container was created before docker 1.12 with default log driver.
-		// We should rewrite it to use the daemon defaults.
-		// Fixes https://github.com/docker/docker/issues/22536
-		if c.HostConfig.LogConfig.Type == "" {
-			if err := daemon.mergeAndVerifyLogConfig(&c.HostConfig.LogConfig); err != nil {
-				logrus.Errorf("Failed to verify log config for container %s: %q", c.ID, err)
-				continue
-			}
-		}
-	}
-
-	var (
-		wg      sync.WaitGroup
-		mapLock sync.Mutex
-	)
 	for _, c := range containers {
-		wg.Add(1)
+		group.Add(1)
 		go func(c *container.Container) {
-			defer wg.Done()
+			defer group.Done()
+			_ = sem.Acquire(context.Background(), 1)
+			defer sem.Release(1)
+
+			if err := daemon.registerName(c); err != nil {
+				logrus.Errorf("Failed to register container name %s: %s", c.ID, err)
+				mapLock.Lock()
+				delete(containers, c.ID)
+				mapLock.Unlock()
+				return
+			}
+			if err := daemon.Register(c); err != nil {
+				logrus.Errorf("Failed to register container %s: %s", c.ID, err)
+				mapLock.Lock()
+				delete(containers, c.ID)
+				mapLock.Unlock()
+				return
+			}
+
+			// The LogConfig.Type is empty if the container was created before docker 1.12 with default log driver.
+			// We should rewrite it to use the daemon defaults.
+			// Fixes https://github.com/docker/docker/issues/22536
+			if c.HostConfig.LogConfig.Type == "" {
+				if err := daemon.mergeAndVerifyLogConfig(&c.HostConfig.LogConfig); err != nil {
+					logrus.Errorf("Failed to verify log config for container %s: %q", c.ID, err)
+				}
+			}
+		}(c)
+	}
+	group.Wait()
+
+	for _, c := range containers {
+		group.Add(1)
+		go func(c *container.Container) {
+			defer group.Done()
+			_ = sem.Acquire(context.Background(), 1)
+			defer sem.Release(1)
+
 			daemon.backportMountSpec(c)
 			if err := daemon.checkpointAndSave(c); err != nil {
 				logrus.WithError(err).WithField("container", c.ID).Error("error saving backported mountspec to disk")
@@ -226,16 +325,17 @@ func (daemon *Daemon) restore() error {
 				alive    bool
 				ec       uint32
 				exitedAt time.Time
+				process  libcontainerdtypes.Process
 			)
 
-			alive, _, err = daemon.containerd.Restore(context.Background(), c.ID, c.InitializeStdio)
+			alive, _, process, err = daemon.containerd.Restore(context.Background(), c.ID, c.InitializeStdio)
 			if err != nil && !errdefs.IsNotFound(err) {
 				logrus.Errorf("Failed to restore container %s with containerd: %s", c.ID, err)
 				return
 			}
-			if !alive {
-				ec, exitedAt, err = daemon.containerd.DeleteTask(context.Background(), c.ID)
-				if err != nil && !errdefs.IsNotFound(err) {
+			if !alive && process != nil {
+				ec, exitedAt, err = process.Delete(context.Background())
+				if err != nil {
 					logrus.WithError(err).Errorf("Failed to delete container %s from containerd", c.ID)
 					return
 				}
@@ -258,11 +358,11 @@ func (daemon *Daemon) restore() error {
 						logrus.WithField("container", c.ID).WithField("state", s).
 							Info("restored container paused")
 						switch s {
-						case libcontainerd.StatusPaused, libcontainerd.StatusPausing:
+						case containerd.Paused, containerd.Pausing:
 							// nothing to do
-						case libcontainerd.StatusStopped:
+						case containerd.Stopped:
 							alive = false
-						case libcontainerd.StatusUnknown:
+						case containerd.Unknown:
 							logrus.WithField("container", c.ID).
 								Error("Unknown status for container during restore")
 						default:
@@ -354,7 +454,8 @@ func (daemon *Daemon) restore() error {
 			c.Unlock()
 		}(c)
 	}
-	wg.Wait()
+	group.Wait()
+
 	daemon.netController, err = daemon.initNetworkController(daemon.configStore, activeSandboxes)
 	if err != nil {
 		return fmt.Errorf("Error initializing network controller: %v", err)
@@ -362,18 +463,24 @@ func (daemon *Daemon) restore() error {
 
 	// Now that all the containers are registered, register the links
 	for _, c := range containers {
-		if err := daemon.registerLinks(c, c.HostConfig); err != nil {
-			logrus.Errorf("failed to register link for container %s: %v", c.ID, err)
-		}
-	}
+		group.Add(1)
+		go func(c *container.Container) {
+			_ = sem.Acquire(context.Background(), 1)
 
-	group := sync.WaitGroup{}
+			if err := daemon.registerLinks(c, c.HostConfig); err != nil {
+				logrus.Errorf("failed to register link for container %s: %v", c.ID, err)
+			}
+
+			sem.Release(1)
+			group.Done()
+		}(c)
+	}
+	group.Wait()
+
 	for c, notifier := range restartContainers {
 		group.Add(1)
-
 		go func(c *container.Container, chNotify chan struct{}) {
-			defer group.Done()
-
+			_ = sem.Acquire(context.Background(), 1)
 			logrus.Debugf("Starting container %s", c.ID)
 
 			// ignore errors here as this is a best effort to wait for children to be
@@ -395,22 +502,27 @@ func (daemon *Daemon) restore() error {
 				logrus.Errorf("Failed to start container %s: %s", c.ID, err)
 			}
 			close(chNotify)
-		}(c, notifier)
 
+			sem.Release(1)
+			group.Done()
+		}(c, notifier)
 	}
 	group.Wait()
 
-	removeGroup := sync.WaitGroup{}
 	for id := range removeContainers {
-		removeGroup.Add(1)
+		group.Add(1)
 		go func(cid string) {
+			_ = sem.Acquire(context.Background(), 1)
+
 			if err := daemon.ContainerRm(cid, &types.ContainerRmConfig{ForceRemove: true, RemoveVolume: true}); err != nil {
 				logrus.Errorf("Failed to remove container %s: %s", cid, err)
 			}
-			removeGroup.Done()
+
+			sem.Release(1)
+			group.Done()
 		}(id)
 	}
-	removeGroup.Wait()
+	group.Wait()
 
 	// any containers that were started above would already have had this done,
 	// however we need to now prepare the mountpoints for the rest of the containers as well.
@@ -431,13 +543,16 @@ func (daemon *Daemon) restore() error {
 
 		group.Add(1)
 		go func(c *container.Container) {
-			defer group.Done()
+			_ = sem.Acquire(context.Background(), 1)
+
 			if err := daemon.prepareMountPoints(c); err != nil {
 				logrus.Error(err)
 			}
+
+			sem.Release(1)
+			group.Done()
 		}(c)
 	}
-
 	group.Wait()
 
 	logrus.Info("Loading containers: done.")
@@ -448,7 +563,18 @@ func (daemon *Daemon) restore() error {
 // RestartSwarmContainers restarts any autostart container which has a
 // swarm endpoint.
 func (daemon *Daemon) RestartSwarmContainers() {
-	group := sync.WaitGroup{}
+	ctx := context.Background()
+
+	// parallelLimit is the maximum number of parallel startup jobs that we
+	// allow (this is the limited used for all startup semaphores). The multipler
+	// (128) was chosen after some fairly significant benchmarking -- don't change
+	// it unless you've tested it significantly (this value is adjusted if
+	// RLIMIT_NOFILE is small to avoid EMFILE).
+	parallelLimit := adjustParallelLimit(len(daemon.List()), 128*runtime.NumCPU())
+
+	var group sync.WaitGroup
+	sem := semaphore.NewWeighted(int64(parallelLimit))
+
 	for _, c := range daemon.List() {
 		if !c.IsRunning() && !c.IsPaused() {
 			// Autostart all the containers which has a
@@ -457,14 +583,21 @@ func (daemon *Daemon) RestartSwarmContainers() {
 			if daemon.configStore.AutoRestart && c.ShouldRestart() && c.NetworkSettings.HasSwarmEndpoint && c.HasBeenStartedBefore {
 				group.Add(1)
 				go func(c *container.Container) {
-					defer group.Done()
+					if err := sem.Acquire(ctx, 1); err != nil {
+						// ctx is done.
+						group.Done()
+						return
+					}
+
 					if err := daemon.containerStart(c, "", "", true); err != nil {
 						logrus.Error(err)
 					}
+
+					sem.Release(1)
+					group.Done()
 				}(c)
 			}
 		}
-
 	}
 	group.Wait()
 }
@@ -674,6 +807,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		logrus.Warnf("Failed to configure golang's threads limit: %v", err)
 	}
 
+	// ensureDefaultAppArmorProfile does nothing if apparmor is disabled
 	if err := ensureDefaultAppArmorProfile(); err != nil {
 		logrus.Errorf(err.Error())
 	}
@@ -783,7 +917,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 
 	for operatingSystem, gd := range d.graphDrivers {
 		layerStores[operatingSystem], err = layer.NewStoreFromOptions(layer.StoreOptions{
-			Root: config.Root,
+			Root:                      config.Root,
 			MetadataStorePathTemplate: filepath.Join(config.Root, "image", "%s", "layerdb"),
 			GraphDriver:               gd,
 			GraphDriverOptions:        config.GraphOptions,
@@ -795,11 +929,9 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		if err != nil {
 			return nil, err
 		}
-	}
 
-	// As layerstore initialization may set the driver
-	for os := range d.graphDrivers {
-		d.graphDrivers[os] = layerStores[os].DriverName()
+		// As layerstore initialization may set the driver
+		d.graphDrivers[operatingSystem] = layerStores[operatingSystem].DriverName()
 	}
 
 	// Configure and validate the kernels security support. Note this is a Linux/FreeBSD
@@ -828,7 +960,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		return nil, err
 	}
 
-	trustKey, err := loadOrCreateTrustKey(config.TrustKeyPath)
+	uuid, err := loadOrCreateUUID(filepath.Join(config.Root, "engine_uuid"))
 	if err != nil {
 		return nil, err
 	}
@@ -860,15 +992,6 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		return nil, err
 	}
 
-	// No content-addressability migration on Windows as it never supported pre-CA
-	if runtime.GOOS != "windows" {
-		migrationStart := time.Now()
-		if err := v1.Migrate(config.Root, d.graphDrivers[runtime.GOOS], layerStores[runtime.GOOS], imageStore, rs, distributionMetadataStore); err != nil {
-			logrus.Errorf("Graph migration failed: %q. Your old graph data was found to be too inconsistent for upgrading to content-addressable storage. Some of the old data was probably not upgraded. We recommend starting over with a clean storage directory if possible.", err)
-		}
-		logrus.Infof("Graph migration to content-addressability took %.2f seconds", time.Since(migrationStart).Seconds())
-	}
-
 	// Discovery is only enabled when the daemon is launched with an address to advertise.  When
 	// initialized, the daemon is registered and we can store the discovery backend as it's read-only
 	if err := d.initDiscovery(config); err != nil {
@@ -882,7 +1005,7 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		return nil, errors.New("Devices cgroup isn't mounted")
 	}
 
-	d.ID = trustKey.PublicKey().KeyID()
+	d.ID = uuid
 	d.repository = daemonRepo
 	d.containers = container.NewMemoryStore()
 	if d.containersReplica, err = container.NewViewDB(); err != nil {
@@ -913,7 +1036,6 @@ func NewDaemon(ctx context.Context, config *config.Config, pluginStore *plugin.S
 		MaxConcurrentUploads:      *config.MaxConcurrentUploads,
 		ReferenceStore:            rs,
 		RegistryService:           registryService,
-		TrustKey:                  trustKey,
 	})
 
 	go d.execCommandGC()

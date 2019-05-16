@@ -23,12 +23,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/gc"
 	"github.com/containerd/containerd/log"
 	"github.com/containerd/containerd/snapshots"
 	"github.com/pkg/errors"
+	bolt "go.etcd.io/bbolt"
 )
 
 const (
@@ -43,8 +43,21 @@ const (
 	// dbVersion represents updates to the schema
 	// version which are additions and compatible with
 	// prior version of the same schema.
-	dbVersion = 2
+	dbVersion = 3
 )
+
+// DBOpt configures how we set up the DB
+type DBOpt func(*dbOptions)
+
+// WithPolicyIsolated isolates contents between namespaces
+func WithPolicyIsolated(o *dbOptions) {
+	o.shared = false
+}
+
+// dbOptions configure db options.
+type dbOptions struct {
+	shared bool
+}
 
 // DB represents a metadata database backed by a bolt
 // database. The database is fully namespaced and stores
@@ -72,19 +85,28 @@ type DB struct {
 	// mutationCallbacks are called after each mutation with the flag
 	// set indicating whether any dirty flags are set
 	mutationCallbacks []func(bool)
+
+	dbopts dbOptions
 }
 
 // NewDB creates a new metadata database using the provided
 // bolt database, content store, and snapshotters.
-func NewDB(db *bolt.DB, cs content.Store, ss map[string]snapshots.Snapshotter) *DB {
+func NewDB(db *bolt.DB, cs content.Store, ss map[string]snapshots.Snapshotter, opts ...DBOpt) *DB {
 	m := &DB{
 		db:      db,
 		ss:      make(map[string]*snapshotter, len(ss)),
 		dirtySS: map[string]struct{}{},
+		dbopts: dbOptions{
+			shared: true,
+		},
+	}
+
+	for _, opt := range opts {
+		opt(&m.dbopts)
 	}
 
 	// Initialize data stores
-	m.cs = newContentStore(m, cs)
+	m.cs = newContentStore(m, m.dbopts.shared, cs)
 	for name, sn := range ss {
 		m.ss[name] = newSnapshotter(m, name, sn)
 	}
@@ -154,7 +176,7 @@ func (m *DB) Init(ctx context.Context) error {
 				if err := m.migrate(tx); err != nil {
 					return errors.Wrapf(err, "failed to migrate to %s.%d", m.schema, m.version)
 				}
-				log.G(ctx).WithField("d", time.Now().Sub(t0)).Debugf("finished database migration to %s.%d", m.schema, m.version)
+				log.G(ctx).WithField("d", time.Since(t0)).Debugf("finished database migration to %s.%d", m.schema, m.version)
 			}
 		}
 
@@ -306,7 +328,7 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 				m.cleanupSnapshotter(snapshotterName)
 
 				sl.Lock()
-				stats.SnapshotD[snapshotterName] = time.Now().Sub(st1)
+				stats.SnapshotD[snapshotterName] = time.Since(st1)
 				sl.Unlock()
 
 				wg.Done()
@@ -321,7 +343,7 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 		go func() {
 			ct1 := time.Now()
 			m.cleanupContent()
-			stats.ContentD = time.Now().Sub(ct1)
+			stats.ContentD = time.Since(ct1)
 			wg.Done()
 		}()
 		m.dirtyCS = false
@@ -329,7 +351,7 @@ func (m *DB) GarbageCollect(ctx context.Context) (gc.Stats, error) {
 
 	m.dirtyL.Unlock()
 
-	stats.MetaD = time.Now().Sub(t1)
+	stats.MetaD = time.Since(t1)
 	m.wlock.Unlock()
 
 	wg.Wait()

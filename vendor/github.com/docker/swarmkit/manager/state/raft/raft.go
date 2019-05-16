@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"code.cloudfoundry.org/clock"
 	"github.com/coreos/etcd/pkg/idutil"
 	"github.com/coreos/etcd/raft"
 	"github.com/coreos/etcd/raft/raftpb"
@@ -27,10 +29,8 @@ import (
 	"github.com/docker/swarmkit/manager/state/store"
 	"github.com/docker/swarmkit/watch"
 	"github.com/gogo/protobuf/proto"
-	"github.com/pivotal-golang/clock"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 	"golang.org/x/time/rate"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -1182,11 +1182,8 @@ func (n *Node) CanRemoveMember(id uint64) bool {
 	}
 
 	nquorum := (len(members)-1)/2 + 1
-	if nreachable < nquorum {
-		return false
-	}
 
-	return true
+	return nreachable >= nquorum
 }
 
 func (n *Node) removeMember(ctx context.Context, id uint64) error {
@@ -1591,10 +1588,7 @@ func (n *Node) ProposeValue(ctx context.Context, storeAction []api.StoreAction, 
 	defer cancel()
 	_, err := n.processInternalRaftRequest(ctx, &api.InternalRaftRequest{Action: storeAction}, cb)
 
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }
 
 // GetVersion returns the sequence information for the current raft round.

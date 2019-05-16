@@ -10,6 +10,7 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
+	fstypes "github.com/tonistiigi/fsutil/types"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -34,7 +35,7 @@ type SyncedDir struct {
 	Name     string
 	Dir      string
 	Excludes []string
-	Map      func(*fsutil.Stat) bool
+	Map      func(string, *fstypes.Stat) bool
 }
 
 // NewFSSyncProvider creates a new provider for sending files from client
@@ -128,7 +129,7 @@ type progressCb func(int, bool)
 type protocol struct {
 	name   string
 	sendFn func(stream grpc.Stream, fs fsutil.FS, progress progressCb) error
-	recvFn func(stream grpc.Stream, destDir string, cu CacheUpdater, progress progressCb) error
+	recvFn func(stream grpc.Stream, destDir string, cu CacheUpdater, progress progressCb, mapFunc func(string, *fstypes.Stat) bool) error
 }
 
 func isProtoSupported(p string) bool {
@@ -157,6 +158,7 @@ type FSSendRequestOpt struct {
 	DestDir          string
 	CacheUpdater     CacheUpdater
 	ProgressCb       func(int, bool)
+	Filter           func(string, *fstypes.Stat) bool
 }
 
 // CacheUpdater is an object capable of sending notifications for the cache hash changes
@@ -224,7 +226,7 @@ func FSSync(ctx context.Context, c session.Caller, opt FSSendRequestOpt) error {
 		panic(fmt.Sprintf("invalid protocol: %q", pr.name))
 	}
 
-	return pr.recvFn(stream, opt.DestDir, opt.CacheUpdater, opt.ProgressCb)
+	return pr.recvFn(stream, opt.DestDir, opt.CacheUpdater, opt.ProgressCb, opt.Filter)
 }
 
 // NewFSSyncTargetDir allows writing into a directory

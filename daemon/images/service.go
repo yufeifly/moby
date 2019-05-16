@@ -14,7 +14,6 @@ import (
 	"github.com/docker/docker/layer"
 	dockerreference "github.com/docker/docker/reference"
 	"github.com/docker/docker/registry"
-	"github.com/docker/libtrust"
 	"github.com/opencontainers/go-digest"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -40,7 +39,6 @@ type ImageServiceConfig struct {
 	MaxConcurrentUploads      int
 	ReferenceStore            dockerreference.Store
 	RegistryService           registry.Service
-	TrustKey                  libtrust.PrivateKey
 }
 
 // NewImageService returns a new ImageService from a configuration
@@ -56,7 +54,6 @@ func NewImageService(config ImageServiceConfig) *ImageService {
 		layerStores:               config.LayerStores,
 		referenceStore:            config.ReferenceStore,
 		registryService:           config.RegistryService,
-		trustKey:                  config.TrustKey,
 		uploadManager:             xfer.NewLayerUploadManager(config.MaxConcurrentUploads),
 	}
 }
@@ -72,7 +69,6 @@ type ImageService struct {
 	pruneRunning              int32
 	referenceStore            dockerreference.Store
 	registryService           registry.Service
-	trustKey                  libtrust.PrivateKey
 	uploadManager             *xfer.LayerUploadManager
 }
 
@@ -205,8 +201,6 @@ func (i *ImageService) LayerDiskUsage(ctx context.Context) (int64, error) {
 				if err == nil {
 					if _, ok := layerRefs[l.ChainID()]; ok {
 						allLayersSize += size
-					} else {
-						logrus.Warnf("found leaked image layer %v", l.ChainID())
 					}
 				} else {
 					logrus.Warnf("failed to get diff size for layer %v", l.ChainID())

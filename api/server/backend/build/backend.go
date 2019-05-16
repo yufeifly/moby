@@ -14,6 +14,7 @@ import (
 	"github.com/docker/docker/pkg/stringid"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
 
 // ImageComponent provides an interface for working with images
@@ -38,6 +39,13 @@ type Backend struct {
 // NewBackend creates a new build backend from components
 func NewBackend(components ImageComponent, builder Builder, fsCache *fscache.FSCache, buildkit *buildkit.Builder) (*Backend, error) {
 	return &Backend{imageComponent: components, builder: builder, fsCache: fsCache, buildkit: buildkit}, nil
+}
+
+// RegisterGRPC registers buildkit controller to the grpc server.
+func (b *Backend) RegisterGRPC(s *grpc.Server) {
+	if b.buildkit != nil {
+		b.buildkit.RegisterGRPC(s)
+	}
 }
 
 // Build builds an image from a Source
@@ -82,13 +90,13 @@ func (b *Backend) Build(ctx context.Context, config backend.BuildConfig) (string
 	if !useBuildKit {
 		stdout := config.ProgressWriter.StdoutFormatter
 		fmt.Fprintf(stdout, "Successfully built %s\n", stringid.TruncateID(imageID))
-		err = tagger.TagImages(image.ID(imageID))
 	}
+	err = tagger.TagImages(image.ID(imageID))
 	return imageID, err
 }
 
 // PruneCache removes all cached build sources
-func (b *Backend) PruneCache(ctx context.Context) (*types.BuildCachePruneReport, error) {
+func (b *Backend) PruneCache(ctx context.Context, opts types.BuildCachePruneOptions) (*types.BuildCachePruneReport, error) {
 	eg, ctx := errgroup.WithContext(ctx)
 
 	var fsCacheSize uint64
@@ -102,9 +110,10 @@ func (b *Backend) PruneCache(ctx context.Context) (*types.BuildCachePruneReport,
 	})
 
 	var buildCacheSize int64
+	var cacheIDs []string
 	eg.Go(func() error {
 		var err error
-		buildCacheSize, err = b.buildkit.Prune(ctx)
+		buildCacheSize, cacheIDs, err = b.buildkit.Prune(ctx, opts)
 		if err != nil {
 			return errors.Wrap(err, "failed to prune build cache")
 		}
@@ -115,7 +124,7 @@ func (b *Backend) PruneCache(ctx context.Context) (*types.BuildCachePruneReport,
 		return nil, err
 	}
 
-	return &types.BuildCachePruneReport{SpaceReclaimed: fsCacheSize + uint64(buildCacheSize)}, nil
+	return &types.BuildCachePruneReport{SpaceReclaimed: fsCacheSize + uint64(buildCacheSize), CachesDeleted: cacheIDs}, nil
 }
 
 // Cancel cancels the build by ID

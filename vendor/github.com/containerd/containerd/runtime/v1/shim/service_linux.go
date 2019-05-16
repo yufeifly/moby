@@ -31,7 +31,7 @@ type linuxPlatform struct {
 	epoller *console.Epoller
 }
 
-func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console, stdin, stdout, stderr string, wg, cwg *sync.WaitGroup) (console.Console, error) {
+func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console, stdin, stdout, stderr string, wg *sync.WaitGroup) (console.Console, error) {
 	if p.epoller == nil {
 		return nil, errors.New("uninitialized epoller")
 	}
@@ -40,6 +40,7 @@ func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console
 	if err != nil {
 		return nil, err
 	}
+	var cwg sync.WaitGroup
 
 	if stdin != "" {
 		in, err := fifo.OpenFifo(ctx, stdin, syscall.O_RDONLY, 0)
@@ -49,9 +50,11 @@ func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console
 		cwg.Add(1)
 		go func() {
 			cwg.Done()
-			p := bufPool.Get().(*[]byte)
-			defer bufPool.Put(p)
-			io.CopyBuffer(epollConsole, in, *p)
+			bp := bufPool.Get().(*[]byte)
+			defer bufPool.Put(bp)
+			io.CopyBuffer(epollConsole, in, *bp)
+			// we need to shutdown epollConsole when pipe broken
+			epollConsole.Shutdown(p.epoller.CloseConsole)
 		}()
 	}
 
@@ -75,6 +78,7 @@ func (p *linuxPlatform) CopyConsole(ctx context.Context, console console.Console
 		outw.Close()
 		wg.Done()
 	}()
+	cwg.Wait()
 	return epollConsole, nil
 }
 

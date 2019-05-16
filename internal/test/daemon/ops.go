@@ -2,6 +2,13 @@ package daemon
 
 import "github.com/docker/docker/internal/test/environment"
 
+// WithDefaultCgroupNamespaceMode sets the default cgroup namespace mode for the daemon
+func WithDefaultCgroupNamespaceMode(mode string) func(*Daemon) {
+	return func(d *Daemon) {
+		d.defaultCgroupNamespaceMode = mode
+	}
+}
+
 // WithExperimental sets the daemon in experimental mode
 func WithExperimental(d *Daemon) {
 	d.experimental = true
@@ -45,6 +52,13 @@ func WithSwarmDefaultAddrPool(defaultAddrPool []string) func(*Daemon) {
 func WithSwarmDefaultAddrPoolSubnetSize(subnetSize uint32) func(*Daemon) {
 	return func(d *Daemon) {
 		d.SubnetSize = subnetSize
+	}
+}
+
+// WithSwarmDataPathPort sets the  swarm datapath port to use for swarm mode
+func WithSwarmDataPathPort(datapathPort uint32) func(*Daemon) {
+	return func(d *Daemon) {
+		d.DataPathPort = datapathPort
 	}
 }
 

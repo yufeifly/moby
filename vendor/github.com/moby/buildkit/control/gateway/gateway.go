@@ -63,7 +63,9 @@ func (gwf *GatewayForwarder) lookupForwarder(ctx context.Context) (gateway.LLBBr
 
 	go func() {
 		<-ctx.Done()
+		gwf.mu.Lock()
 		gwf.updateCond.Broadcast()
+		gwf.mu.Unlock()
 	}()
 
 	gwf.mu.RLock()
@@ -124,4 +126,20 @@ func (gwf *GatewayForwarder) Return(ctx context.Context, req *gwapi.ReturnReques
 	}
 	res, err := fwd.Return(ctx, req)
 	return res, err
+}
+
+func (gwf *GatewayForwarder) ReadDir(ctx context.Context, req *gwapi.ReadDirRequest) (*gwapi.ReadDirResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding ReadDir")
+	}
+	return fwd.ReadDir(ctx, req)
+}
+
+func (gwf *GatewayForwarder) StatFile(ctx context.Context, req *gwapi.StatFileRequest) (*gwapi.StatFileResponse, error) {
+	fwd, err := gwf.lookupForwarder(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "forwarding StatFile")
+	}
+	return fwd.StatFile(ctx, req)
 }

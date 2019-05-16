@@ -189,7 +189,9 @@ func (ls *layerStore) loadLayer(layer ChainID) (*roLayer, error) {
 }
 
 func (ls *layerStore) loadMount(mount string) error {
-	if _, ok := ls.mounts[mount]; ok {
+	ls.mountL.Lock()
+	defer ls.mountL.Unlock()
+	if m := ls.mounts[mount]; m != nil {
 		return nil
 	}
 
@@ -253,12 +255,13 @@ func (ls *layerStore) applyTar(tx *fileMetadataTransaction, ts io.Reader, parent
 	}
 
 	applySize, err := ls.driver.ApplyDiff(layer.cacheID, parent, rdr)
+	// discard trailing data but ensure metadata is picked up to reconstruct stream
+	// unconditionally call io.Copy here before checking err to ensure the resources
+	// allocated by NewInputTarStream above are always released
+	io.Copy(ioutil.Discard, rdr) // ignore error as reader may be closed
 	if err != nil {
 		return err
 	}
-
-	// Discard trailing data but ensure metadata is picked up to reconstruct stream
-	io.Copy(ioutil.Discard, rdr) // ignore error as reader may be closed
 
 	layer.size = applySize
 	layer.diffID = DiffID(digester.Digest())
@@ -476,7 +479,7 @@ func (ls *layerStore) Release(l Layer) ([]Metadata, error) {
 	return ls.releaseLayer(layer)
 }
 
-func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWLayerOpts) (RWLayer, error) {
+func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWLayerOpts) (_ RWLayer, err error) {
 	var (
 		storageOpt map[string]string
 		initFunc   MountInit
@@ -490,13 +493,21 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 	}
 
 	ls.mountL.Lock()
-	defer ls.mountL.Unlock()
-	m, ok := ls.mounts[name]
-	if ok {
+	if _, ok := ls.mounts[name]; ok {
+		ls.mountL.Unlock()
 		return nil, ErrMountNameConflict
 	}
+	// Avoid name collision by temporary assigning nil
+	ls.mounts[name] = nil
+	ls.mountL.Unlock()
+	defer func() {
+		if err != nil {
+			ls.mountL.Lock()
+			delete(ls.mounts, name)
+			ls.mountL.Unlock()
+		}
+	}()
 
-	var err error
 	var pid string
 	var p *roLayer
 	if string(parent) != "" {
@@ -516,7 +527,7 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 		}()
 	}
 
-	m = &mountedLayer{
+	m := &mountedLayer{
 		name:       name,
 		parent:     p,
 		mountID:    ls.mountID(name),
@@ -527,7 +538,7 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 	if initFunc != nil {
 		pid, err = ls.initMount(m.mountID, pid, mountLabel, initFunc, storageOpt)
 		if err != nil {
-			return nil, err
+			return
 		}
 		m.initID = pid
 	}
@@ -537,10 +548,10 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 	}
 
 	if err = ls.driver.CreateReadWrite(m.mountID, pid, createOpts); err != nil {
-		return nil, err
+		return
 	}
 	if err = ls.saveMount(m); err != nil {
-		return nil, err
+		return
 	}
 
 	return m.getReference(), nil
@@ -548,9 +559,9 @@ func (ls *layerStore) CreateRWLayer(name string, parent ChainID, opts *CreateRWL
 
 func (ls *layerStore) GetRWLayer(id string) (RWLayer, error) {
 	ls.mountL.Lock()
-	defer ls.mountL.Unlock()
-	mount, ok := ls.mounts[id]
-	if !ok {
+	mount := ls.mounts[id]
+	ls.mountL.Unlock()
+	if mount == nil {
 		return nil, ErrMountDoesNotExist
 	}
 
@@ -560,8 +571,8 @@ func (ls *layerStore) GetRWLayer(id string) (RWLayer, error) {
 func (ls *layerStore) GetMountID(id string) (string, error) {
 	ls.mountL.Lock()
 	defer ls.mountL.Unlock()
-	mount, ok := ls.mounts[id]
-	if !ok {
+	mount := ls.mounts[id]
+	if mount == nil {
 		return "", ErrMountDoesNotExist
 	}
 	logrus.Debugf("GetMountID id: %s -> mountID: %s", id, mount.mountID)
@@ -571,9 +582,9 @@ func (ls *layerStore) GetMountID(id string) (string, error) {
 
 func (ls *layerStore) ReleaseRWLayer(l RWLayer) ([]Metadata, error) {
 	ls.mountL.Lock()
-	defer ls.mountL.Unlock()
-	m, ok := ls.mounts[l.Name()]
-	if !ok {
+	m := ls.mounts[l.Name()]
+	ls.mountL.Unlock()
+	if m == nil {
 		return []Metadata{}, nil
 	}
 
@@ -605,7 +616,9 @@ func (ls *layerStore) ReleaseRWLayer(l RWLayer) ([]Metadata, error) {
 		return nil, err
 	}
 
+	ls.mountL.Lock()
 	delete(ls.mounts, m.Name())
+	ls.mountL.Unlock()
 
 	ls.layerL.Lock()
 	defer ls.layerL.Unlock()
@@ -633,7 +646,9 @@ func (ls *layerStore) saveMount(mount *mountedLayer) error {
 		}
 	}
 
+	ls.mountL.Lock()
 	ls.mounts[mount.name] = mount
+	ls.mountL.Unlock()
 
 	return nil
 }

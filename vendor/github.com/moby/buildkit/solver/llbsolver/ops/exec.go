@@ -10,14 +10,14 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/boltdb/bolt"
 	"github.com/containerd/containerd/mount"
+	"github.com/containerd/containerd/platforms"
+	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/locker"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
@@ -26,16 +26,22 @@ import (
 	"github.com/moby/buildkit/identity"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/session/secrets"
+	"github.com/moby/buildkit/session/sshforward"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/llbsolver"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/progress/logs"
+	utilsystem "github.com/moby/buildkit/util/system"
 	"github.com/moby/buildkit/worker"
 	digest "github.com/opencontainers/go-digest"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	bolt "go.etcd.io/bbolt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const execCacheType = "buildkit.exec.v0"
@@ -47,12 +53,13 @@ type execOp struct {
 	md        *metadata.Store
 	exec      executor.Executor
 	w         worker.Worker
+	platform  *pb.Platform
 	numInputs int
 
 	cacheMounts map[string]*cacheRefShare
 }
 
-func NewExecOp(v solver.Vertex, op *pb.Op_Exec, cm cache.Manager, sm *session.Manager, md *metadata.Store, exec executor.Executor, w worker.Worker) (solver.Op, error) {
+func NewExecOp(v solver.Vertex, op *pb.Op_Exec, platform *pb.Platform, cm cache.Manager, sm *session.Manager, md *metadata.Store, exec executor.Executor, w worker.Worker) (solver.Op, error) {
 	return &execOp{
 		op:          op.Exec,
 		cm:          cm,
@@ -61,6 +68,7 @@ func NewExecOp(v solver.Vertex, op *pb.Op_Exec, cm cache.Manager, sm *session.Ma
 		exec:        exec,
 		numInputs:   len(v.Inputs()),
 		w:           w,
+		platform:    platform,
 		cacheMounts: map[string]*cacheRefShare{},
 	}, nil
 }
@@ -94,16 +102,27 @@ func (e *execOp) CacheMap(ctx context.Context, index int) (*solver.CacheMap, boo
 	}
 	op.Meta.ProxyEnv = nil
 
+	p := platforms.DefaultSpec()
+	if e.platform != nil {
+		p = specs.Platform{
+			OS:           e.platform.OS,
+			Architecture: e.platform.Architecture,
+			Variant:      e.platform.Variant,
+		}
+	}
+
 	dt, err := json.Marshal(struct {
-		Type string
-		Exec *pb.ExecOp
-		OS   string
-		Arch string
+		Type    string
+		Exec    *pb.ExecOp
+		OS      string
+		Arch    string
+		Variant string `json:",omitempty"`
 	}{
-		Type: execCacheType,
-		Exec: &op,
-		OS:   runtime.GOOS,
-		Arch: runtime.GOARCH,
+		Type:    execCacheType,
+		Exec:    &op,
+		OS:      p.OS,
+		Arch:    p.Architecture,
+		Variant: p.Variant,
 	})
 	if err != nil {
 		return nil, false, err
@@ -131,7 +150,7 @@ func (e *execOp) CacheMap(ctx context.Context, index int) (*solver.CacheMap, boo
 			cm.Deps[i].Selector = digest.FromBytes(bytes.Join(dgsts, []byte{0}))
 		}
 		if !dep.NoContentBasedHash {
-			cm.Deps[i].ComputeDigestFunc = llbsolver.NewContentHashFunc(dedupePaths(dep.Selectors))
+			cm.Deps[i].ComputeDigestFunc = llbsolver.NewContentHashFunc(toSelectors(dedupePaths(dep.Selectors)))
 		}
 	}
 
@@ -147,7 +166,7 @@ func dedupePaths(inp []string) []string {
 	for p1 := range old {
 		var skip bool
 		for p2 := range old {
-			if p1 != p2 && strings.HasPrefix(p1, p2) {
+			if p1 != p2 && strings.HasPrefix(p1, p2+"/") {
 				skip = true
 				break
 			}
@@ -160,6 +179,14 @@ func dedupePaths(inp []string) []string {
 		return paths[i] < paths[j]
 	})
 	return paths
+}
+
+func toSelectors(p []string) []llbsolver.Selector {
+	sel := make([]llbsolver.Selector, 0, len(p))
+	for _, p := range p {
+		sel = append(sel, llbsolver.Selector{Path: p, FollowLinks: true})
+	}
+	return sel
 }
 
 type dep struct {
@@ -183,7 +210,7 @@ func (e *execOp) getMountDeps() ([]dep, error) {
 			deps[m.Input].Selectors = append(deps[m.Input].Selectors, sel)
 		}
 
-		if !m.Readonly || m.Dest == pb.RootMount { // exclude read-only rootfs
+		if (!m.Readonly || m.Dest == pb.RootMount) && m.Output != -1 { // exclude read-only rootfs && read-write mounts
 			deps[m.Input].NoContentBasedHash = true
 		}
 	}
@@ -279,6 +306,106 @@ func (e *execOp) getRefCacheDirNoCache(ctx context.Context, key string, ref cach
 	return mRef, nil
 }
 
+func (e *execOp) getSSHMountable(ctx context.Context, m *pb.Mount) (cache.Mountable, error) {
+	sessionID := session.FromContext(ctx)
+	if sessionID == "" {
+		return nil, errors.New("could not access local files without session")
+	}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	caller, err := e.sm.Get(timeoutCtx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := sshforward.CheckSSHID(ctx, caller, m.SSHOpt.ID); err != nil {
+		if m.SSHOpt.Optional {
+			return nil, nil
+		}
+		if st, ok := status.FromError(err); ok && st.Code() == codes.Unimplemented {
+			return nil, errors.Errorf("no SSH key %q forwarded from the client", m.SSHOpt.ID)
+		}
+		return nil, err
+	}
+
+	return &sshMount{mount: m, caller: caller, idmap: e.cm.IdentityMapping()}, nil
+}
+
+type sshMount struct {
+	mount  *pb.Mount
+	caller session.Caller
+	idmap  *idtools.IdentityMapping
+}
+
+func (sm *sshMount) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
+	return &sshMountInstance{sm: sm, idmap: sm.idmap}, nil
+}
+
+type sshMountInstance struct {
+	sm      *sshMount
+	cleanup func() error
+	idmap   *idtools.IdentityMapping
+}
+
+func (sm *sshMountInstance) Mount() ([]mount.Mount, error) {
+	ctx, cancel := context.WithCancel(context.TODO())
+
+	uid := int(sm.sm.mount.SSHOpt.Uid)
+	gid := int(sm.sm.mount.SSHOpt.Gid)
+
+	if sm.idmap != nil {
+		identity, err := sm.idmap.ToHost(idtools.Identity{
+			UID: uid,
+			GID: gid,
+		})
+		if err != nil {
+			return nil, err
+		}
+		uid = identity.UID
+		gid = identity.GID
+	}
+
+	sock, cleanup, err := sshforward.MountSSHSocket(ctx, sm.sm.caller, sshforward.SocketOpt{
+		ID:   sm.sm.mount.SSHOpt.ID,
+		UID:  uid,
+		GID:  gid,
+		Mode: int(sm.sm.mount.SSHOpt.Mode & 0777),
+	})
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	sm.cleanup = func() error {
+		var err error
+		if cleanup != nil {
+			err = cleanup()
+		}
+		cancel()
+		return err
+	}
+
+	return []mount.Mount{{
+		Type:    "bind",
+		Source:  sock,
+		Options: []string{"rbind"},
+	}}, nil
+}
+
+func (sm *sshMountInstance) Release() error {
+	if sm.cleanup != nil {
+		if err := sm.cleanup(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (sm *sshMountInstance) IdentityMapping() *idtools.IdentityMapping {
+	return sm.idmap
+}
+
 func (e *execOp) getSecretMountable(ctx context.Context, m *pb.Mount) (cache.Mountable, error) {
 	if m.SecretOpt == nil {
 		return nil, errors.Errorf("invalid sercet mount options")
@@ -311,21 +438,23 @@ func (e *execOp) getSecretMountable(ctx context.Context, m *pb.Mount) (cache.Mou
 		return nil, err
 	}
 
-	return &secretMount{mount: m, data: dt}, nil
+	return &secretMount{mount: m, data: dt, idmap: e.cm.IdentityMapping()}, nil
 }
 
 type secretMount struct {
 	mount *pb.Mount
 	data  []byte
+	idmap *idtools.IdentityMapping
 }
 
 func (sm *secretMount) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
-	return &secretMountInstance{sm: sm}, nil
+	return &secretMountInstance{sm: sm, idmap: sm.idmap}, nil
 }
 
 type secretMountInstance struct {
-	sm   *secretMount
-	root string
+	sm    *secretMount
+	root  string
+	idmap *idtools.IdentityMapping
 }
 
 func (sm *secretMountInstance) Mount() ([]mount.Mount, error) {
@@ -360,11 +489,26 @@ func (sm *secretMountInstance) Mount() ([]mount.Mount, error) {
 		return nil, err
 	}
 
-	if err := os.Chown(fp, int(sm.sm.mount.SecretOpt.Uid), int(sm.sm.mount.SecretOpt.Gid)); err != nil {
+	uid := int(sm.sm.mount.SecretOpt.Uid)
+	gid := int(sm.sm.mount.SecretOpt.Gid)
+
+	if sm.idmap != nil {
+		identity, err := sm.idmap.ToHost(idtools.Identity{
+			UID: uid,
+			GID: gid,
+		})
+		if err != nil {
+			return nil, err
+		}
+		uid = identity.UID
+		gid = identity.GID
+	}
+
+	if err := os.Chown(fp, uid, gid); err != nil {
 		return nil, err
 	}
 
-	if err := os.Chmod(fp, os.FileMode(sm.sm.mount.SecretOpt.Mode)); err != nil {
+	if err := os.Chmod(fp, os.FileMode(sm.sm.mount.SecretOpt.Mode&0777)); err != nil {
 		return nil, err
 	}
 
@@ -383,6 +527,19 @@ func (sm *secretMountInstance) Release() error {
 		return os.RemoveAll(sm.root)
 	}
 	return nil
+}
+
+func (sm *secretMountInstance) IdentityMapping() *idtools.IdentityMapping {
+	return sm.idmap
+}
+
+func addDefaultEnvvar(env []string, k, v string) []string {
+	for _, e := range env {
+		if strings.HasPrefix(e, k+"=") {
+			return env
+		}
+	}
+	return append(env, k+"="+v)
 }
 
 func (e *execOp) Exec(ctx context.Context, inputs []solver.Result) ([]solver.Result, error) {
@@ -471,7 +628,7 @@ func (e *execOp) Exec(ctx context.Context, inputs []solver.Result) ([]solver.Res
 			}
 
 		case pb.MountType_TMPFS:
-			mountable = newTmpfs()
+			mountable = newTmpfs(e.cm.IdentityMapping())
 
 		case pb.MountType_SECRET:
 			secretMount, err := e.getSecretMountable(ctx, m)
@@ -482,6 +639,17 @@ func (e *execOp) Exec(ctx context.Context, inputs []solver.Result) ([]solver.Res
 				continue
 			}
 			mountable = secretMount
+
+		case pb.MountType_SSH:
+			sshMount, err := e.getSSHMountable(ctx, m)
+			if err != nil {
+				return nil, err
+			}
+			if sshMount == nil {
+				continue
+			}
+			mountable = sshMount
+
 		default:
 			return nil, errors.Errorf("mount type %s not implemented", m.MountType)
 		}
@@ -528,11 +696,13 @@ func (e *execOp) Exec(ctx context.Context, inputs []solver.Result) ([]solver.Res
 		ReadonlyRootFS: readonlyRootFS,
 		ExtraHosts:     extraHosts,
 		NetMode:        e.op.Network,
+		SecurityMode:   e.op.Security,
 	}
 
 	if e.op.Meta.ProxyEnv != nil {
 		meta.Env = append(meta.Env, proxyEnvList(e.op.Meta.ProxyEnv)...)
 	}
+	meta.Env = addDefaultEnvvar(meta.Env, "PATH", utilsystem.DefaultPathEnv)
 
 	stdout, stderr := logs.NewLogStreams(ctx, os.Getenv("BUILDKIT_DEBUG_EXEC_OUTPUT") == "1")
 	defer stdout.Close()
@@ -575,19 +745,21 @@ func proxyEnvList(p *pb.ProxyEnv) []string {
 	return out
 }
 
-func newTmpfs() cache.Mountable {
-	return &tmpfs{}
+func newTmpfs(idmap *idtools.IdentityMapping) cache.Mountable {
+	return &tmpfs{idmap: idmap}
 }
 
 type tmpfs struct {
+	idmap *idtools.IdentityMapping
 }
 
 func (f *tmpfs) Mount(ctx context.Context, readonly bool) (snapshot.Mountable, error) {
-	return &tmpfsMount{readonly: readonly}, nil
+	return &tmpfsMount{readonly: readonly, idmap: f.idmap}, nil
 }
 
 type tmpfsMount struct {
 	readonly bool
+	idmap    *idtools.IdentityMapping
 }
 
 func (m *tmpfsMount) Mount() ([]mount.Mount, error) {
@@ -603,6 +775,10 @@ func (m *tmpfsMount) Mount() ([]mount.Mount, error) {
 }
 func (m *tmpfsMount) Release() error {
 	return nil
+}
+
+func (m *tmpfsMount) IdentityMapping() *idtools.IdentityMapping {
+	return m.idmap
 }
 
 var cacheRefsLocker = locker.New()

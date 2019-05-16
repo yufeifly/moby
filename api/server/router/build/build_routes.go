@@ -18,6 +18,7 @@ import (
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/versions"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/ioutils"
@@ -147,6 +148,17 @@ func newImageBuildOptions(ctx context.Context, r *http.Request) (*types.ImageBui
 	}
 	options.Version = builderVersion
 
+	if versions.GreaterThanOrEqualTo(version, "1.40") {
+		outputsJSON := r.FormValue("outputs")
+		if outputsJSON != "" {
+			var outputs []types.ImageBuildOutput
+			if err := json.Unmarshal([]byte(outputsJSON), &outputs); err != nil {
+				return nil, err
+			}
+			options.Outputs = outputs
+		}
+	}
+
 	return options, nil
 }
 
@@ -161,7 +173,29 @@ func parseVersion(s string) (types.BuilderVersion, error) {
 }
 
 func (br *buildRouter) postPrune(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	report, err := br.backend.PruneCache(ctx)
+	if err := httputils.ParseForm(r); err != nil {
+		return err
+	}
+	filters, err := filters.FromJSON(r.Form.Get("filters"))
+	if err != nil {
+		return errors.Wrap(err, "could not parse filters")
+	}
+	ksfv := r.FormValue("keep-storage")
+	if ksfv == "" {
+		ksfv = "0"
+	}
+	ks, err := strconv.Atoi(ksfv)
+	if err != nil {
+		return errors.Wrapf(err, "keep-storage is in bytes and expects an integer, got %v", ksfv)
+	}
+
+	opts := types.BuildCachePruneOptions{
+		All:         httputils.BoolValue(r, "all"),
+		Filters:     filters,
+		KeepStorage: int64(ks),
+	}
+
+	report, err := br.backend.PruneCache(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -228,11 +262,6 @@ func (br *buildRouter) postBuild(ctx context.Context, w http.ResponseWriter, r *
 
 	if buildOptions.Squash && !br.daemon.HasExperimental() {
 		return errdefs.InvalidParameter(errors.New("squash is only supported with experimental mode"))
-	}
-
-	// check if the builder feature has been enabled from daemon as well.
-	if buildOptions.Version == types.BuilderBuildKit && br.builderVersion != "" && br.builderVersion != types.BuilderBuildKit {
-		return errdefs.InvalidParameter(errors.New("buildkit is not enabled on daemon"))
 	}
 
 	out := io.Writer(output)

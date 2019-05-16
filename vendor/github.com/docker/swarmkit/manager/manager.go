@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"github.com/docker/swarmkit/identity"
 	"github.com/docker/swarmkit/log"
 	"github.com/docker/swarmkit/manager/allocator"
+	"github.com/docker/swarmkit/manager/allocator/cnmallocator"
 	"github.com/docker/swarmkit/manager/allocator/networkallocator"
 	"github.com/docker/swarmkit/manager/controlapi"
 	"github.com/docker/swarmkit/manager/dispatcher"
@@ -44,7 +46,6 @@ import (
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
@@ -127,12 +128,8 @@ type Config struct {
 	// FIPS setting.
 	FIPS bool
 
-	// DefaultAddrPool specifies default subnet pool for global scope networks
-	DefaultAddrPool []*net.IPNet
-
-	// SubnetSize specifies the subnet size of the networks created from
-	// the default subnet pool
-	SubnetSize int
+	// NetworkConfig stores network related config for the cluster
+	NetworkConfig *cnmallocator.NetworkConfig
 }
 
 // Manager is the cluster manager for Swarm.
@@ -945,18 +942,21 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 			rootCA,
 			m.config.FIPS,
 			nil,
+			0,
 			0)
 
-		var defaultAddrPool []string
-		for _, p := range m.config.DefaultAddrPool {
-			defaultAddrPool = append(defaultAddrPool, p.String())
-		}
 		// If defaultAddrPool is valid we update cluster object with new value
-		if defaultAddrPool != nil {
-			clusterObj.DefaultAddressPool = defaultAddrPool
-			clusterObj.SubnetSize = uint32(m.config.SubnetSize)
-		}
+		// If VXLANUDPPort is not 0 then we call update cluster object with new value
+		if m.config.NetworkConfig != nil {
+			if m.config.NetworkConfig.DefaultAddrPool != nil {
+				clusterObj.DefaultAddressPool = m.config.NetworkConfig.DefaultAddrPool
+				clusterObj.SubnetSize = m.config.NetworkConfig.SubnetSize
+			}
 
+			if m.config.NetworkConfig.VXLANUDPPort != 0 {
+				clusterObj.VXLANUDPPort = m.config.NetworkConfig.VXLANUDPPort
+			}
+		}
 		err := store.CreateCluster(tx, clusterObj)
 
 		if err != nil && err != store.ErrExist {
@@ -965,7 +965,7 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 
 		// Add Node entry for ourself, if one
 		// doesn't exist already.
-		freshCluster := nil == store.CreateNode(tx, managerNode(nodeID, m.config.Availability))
+		freshCluster := nil == store.CreateNode(tx, managerNode(nodeID, m.config.Availability, clusterObj.VXLANUDPPort))
 
 		if freshCluster {
 			// This is a fresh swarm cluster. Add to store now any initial
@@ -998,29 +998,33 @@ func (m *Manager) becomeLeader(ctx context.Context) {
 	m.roleManager = newRoleManager(s, m.raftNode)
 
 	// TODO(stevvooe): Allocate a context that can be used to
-	// shutdown underlying manager processes when leadership is
+	// shutdown underlying manager processes when leadership isTestUpdaterRollback
 	// lost.
 
 	// If DefaultAddrPool is null, Read from store and check if
 	// DefaultAddrPool info is stored in cluster object
-	if m.config.DefaultAddrPool == nil {
+	// If VXLANUDPPort is 0, read it from the store - cluster object
+	if m.config.NetworkConfig == nil || m.config.NetworkConfig.DefaultAddrPool == nil || m.config.NetworkConfig.VXLANUDPPort == 0 {
 		var cluster *api.Cluster
 		s.View(func(tx store.ReadTx) {
 			cluster = store.GetCluster(tx, clusterID)
 		})
 		if cluster.DefaultAddressPool != nil {
-			for _, address := range cluster.DefaultAddressPool {
-				_, b, err := net.ParseCIDR(address)
-				if err != nil {
-					log.G(ctx).WithError(err).Error("Default Address Pool reading failed for cluster object  %s", address)
-				}
-				m.config.DefaultAddrPool = append(m.config.DefaultAddrPool, b)
+			if m.config.NetworkConfig == nil {
+				m.config.NetworkConfig = &cnmallocator.NetworkConfig{}
 			}
+			m.config.NetworkConfig.DefaultAddrPool = append(m.config.NetworkConfig.DefaultAddrPool, cluster.DefaultAddressPool...)
+			m.config.NetworkConfig.SubnetSize = cluster.SubnetSize
 		}
-		m.config.SubnetSize = int(cluster.SubnetSize)
+		if cluster.VXLANUDPPort != 0 {
+			if m.config.NetworkConfig == nil {
+				m.config.NetworkConfig = &cnmallocator.NetworkConfig{}
+			}
+			m.config.NetworkConfig.VXLANUDPPort = cluster.VXLANUDPPort
+		}
 	}
 
-	m.allocator, err = allocator.New(s, m.config.PluginGetter, m.config.DefaultAddrPool, m.config.SubnetSize)
+	m.allocator, err = allocator.New(s, m.config.PluginGetter, m.config.NetworkConfig)
 	if err != nil {
 		log.G(ctx).WithError(err).Error("failed to create allocator")
 		// TODO(stevvooe): It doesn't seem correct here to fail
@@ -1144,7 +1148,8 @@ func defaultClusterObject(
 	rootCA *ca.RootCA,
 	fips bool,
 	defaultAddressPool []string,
-	subnetSize int) *api.Cluster {
+	subnetSize uint32,
+	vxlanUDPPort uint32) *api.Cluster {
 	var caKey []byte
 	if rcaSigner, err := rootCA.Signer(); err == nil {
 		caKey = rcaSigner.Key
@@ -1178,12 +1183,13 @@ func defaultClusterObject(
 		UnlockKeys:         initialUnlockKeys,
 		FIPS:               fips,
 		DefaultAddressPool: defaultAddressPool,
-		SubnetSize:         uint32(subnetSize),
+		SubnetSize:         subnetSize,
+		VXLANUDPPort:       vxlanUDPPort,
 	}
 }
 
 // managerNode creates a new node with NodeRoleManager role.
-func managerNode(nodeID string, availability api.NodeSpec_Availability) *api.Node {
+func managerNode(nodeID string, availability api.NodeSpec_Availability, vxlanPort uint32) *api.Node {
 	return &api.Node{
 		ID: nodeID,
 		Certificate: api.Certificate{
@@ -1198,6 +1204,7 @@ func managerNode(nodeID string, availability api.NodeSpec_Availability) *api.Nod
 			Membership:   api.NodeMembershipAccepted,
 			Availability: availability,
 		},
+		VXLANUDPPort: vxlanPort,
 	}
 }
 

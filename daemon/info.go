@@ -2,6 +2,7 @@ package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -61,8 +62,8 @@ func (daemon *Daemon) SystemInfo() (*types.Info, error) {
 		ServerVersion:      dockerversion.Version,
 		ClusterStore:       daemon.configStore.ClusterStore,
 		ClusterAdvertise:   daemon.configStore.ClusterAdvertise,
-		HTTPProxy:          sockets.GetProxyEnv("http_proxy"),
-		HTTPSProxy:         sockets.GetProxyEnv("https_proxy"),
+		HTTPProxy:          maskCredentials(sockets.GetProxyEnv("http_proxy")),
+		HTTPSProxy:         maskCredentials(sockets.GetProxyEnv("https_proxy")),
 		NoProxy:            sockets.GetProxyEnv("no_proxy"),
 		LiveRestoreEnabled: daemon.configStore.LiveRestoreEnabled,
 		Isolation:          daemon.defaultIsolation,
@@ -117,6 +118,7 @@ func (daemon *Daemon) SystemVersion() types.Version {
 
 	v.Platform.Name = dockerversion.PlatformName
 
+	daemon.fillPlatformVersion(&v)
 	return v
 }
 
@@ -129,6 +131,10 @@ func (daemon *Daemon) fillDriverInfo(v *types.Info) {
 		drivers += gd
 		if len(daemon.graphDrivers) > 1 {
 			drivers += fmt.Sprintf(" (%s) ", os)
+		}
+		switch gd {
+		case "aufs", "devicemapper", "overlay":
+			v.Warnings = append(v.Warnings, fmt.Sprintf("WARNING: the %s storage-driver is deprecated, and will be removed in a future release.", gd))
 		}
 	}
 	drivers = strings.TrimSpace(drivers)
@@ -169,6 +175,13 @@ func (daemon *Daemon) fillSecurityOptions(v *types.Info, sysInfo *sysinfo.SysInf
 	if rootIDs := daemon.idMapping.RootPair(); rootIDs.UID != 0 || rootIDs.GID != 0 {
 		securityOptions = append(securityOptions, "name=userns")
 	}
+	if daemon.Rootless() {
+		securityOptions = append(securityOptions, "name=rootless")
+	}
+	if daemon.cgroupNamespacesEnabled(sysInfo) {
+		securityOptions = append(securityOptions, "name=cgroupns")
+	}
+
 	v.SecurityOptions = securityOptions
 }
 
@@ -244,4 +257,14 @@ func operatingSystem() string {
 		}
 	}
 	return operatingSystem
+}
+
+func maskCredentials(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.User == nil {
+		return rawURL
+	}
+	parsedURL.User = url.UserPassword("xxxxx", "xxxxx")
+	maskedURL := parsedURL.String()
+	return maskedURL
 }

@@ -40,7 +40,6 @@ func (s Stdio) IsNull() bool {
 
 // Process on a system
 type Process interface {
-	State
 	// ID returns the id for the process
 	ID() string
 	// Pid returns the pid for the process
@@ -57,10 +56,6 @@ type Process interface {
 	Status(context.Context) (string, error)
 	// Wait blocks until the process has exited
 	Wait()
-}
-
-// State of a process
-type State interface {
 	// Resize resizes the process console
 	Resize(ws console.WinSize) error
 	// Start execution of the process
@@ -77,7 +72,7 @@ type State interface {
 // platform implementations
 type Platform interface {
 	CopyConsole(ctx context.Context, console console.Console, stdin, stdout, stderr string,
-		wg, cwg *sync.WaitGroup) (console.Console, error)
+		wg *sync.WaitGroup) (console.Console, error)
 	ShutdownConsole(ctx context.Context, console console.Console) error
 	Close() error
 }

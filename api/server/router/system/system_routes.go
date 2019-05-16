@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/server/httputils"
+	"github.com/docker/docker/api/server/router/build"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
@@ -26,8 +27,17 @@ func optionsHandler(ctx context.Context, w http.ResponseWriter, r *http.Request,
 }
 
 func (s *systemRouter) pingHandler(ctx context.Context, w http.ResponseWriter, r *http.Request, vars map[string]string) error {
-	if bv := s.builderVersion; bv != "" {
+	w.Header().Add("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Add("Pragma", "no-cache")
+
+	builderVersion := build.BuilderVersion(*s.features)
+	if bv := builderVersion; bv != "" {
 		w.Header().Set("Builder-Version", string(bv))
+	}
+	if r.Method == http.MethodHead {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Content-Length", "0")
+		return nil
 	}
 	_, err := w.Write([]byte{'O', 'K'})
 	return err
@@ -40,6 +50,7 @@ func (s *systemRouter) getInfo(ctx context.Context, w http.ResponseWriter, r *ht
 	}
 	if s.cluster != nil {
 		info.Swarm = s.cluster.Info()
+		info.Warnings = append(info.Warnings, info.Swarm.Warnings...)
 	}
 
 	if versions.LessThan(httputils.VersionFromContext(ctx), "1.25") {

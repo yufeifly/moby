@@ -52,6 +52,15 @@ type Process interface {
 	Status(context.Context) (Status, error)
 }
 
+// NewExitStatus populates an ExitStatus
+func NewExitStatus(code uint32, t time.Time, err error) *ExitStatus {
+	return &ExitStatus{
+		code:     code,
+		exitedAt: t,
+		err:      err,
+	}
+}
+
 // ExitStatus encapsulates a process' exit status.
 // It is used by `Wait()` to return either a process exit code or an error
 type ExitStatus struct {
@@ -111,9 +120,11 @@ func (p *process) Start(ctx context.Context) error {
 		ExecID:      p.id,
 	})
 	if err != nil {
-		p.io.Cancel()
-		p.io.Wait()
-		p.io.Close()
+		if p.io != nil {
+			p.io.Cancel()
+			p.io.Wait()
+			p.io.Close()
+		}
 		return errdefs.FromGRPC(err)
 	}
 	p.pid = r.Pid
